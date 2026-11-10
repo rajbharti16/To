@@ -8,6 +8,7 @@ from app.deps import lzt
 from app.engine import buy_one
 from app.lzt import LztError
 from app.utils.filters import passes
+from app.utils.money import fmt_money
 from app.utils.texts import menu_text
 
 router = Router()
@@ -25,11 +26,11 @@ async def show(cq: CallbackQuery, text: str, markup):
 
 
 async def live_state():
-    """Profile + balances, both degrade to safe defaults on API failure."""
     try:
         return await lzt.profile(), await lzt.balances()
     except LztError:
-        return {"username": "unreachable", "user_id": 0, "sympathies": 0}, []
+        return {"username": "unreachable", "user_id": 0, "sympathies": 0,
+                "balance": 0.0, "hold": 0.0, "currency": "usd"}, []
 
 
 @router.message(Command("start"))
@@ -69,15 +70,19 @@ async def cb_go(cq: CallbackQuery):
     await cq.answer("scanning…")
     s = await db.get_settings(cq.from_user.id)
     try:
-        total = await lzt.balance_total(s["currency"])
+        wallet = await lzt.balance_for_buy(s["currency"], float(s["price_min"]))
     except LztError as e:
         return await cq.message.answer(f"❌ Balance unavailable: {e}")
-    if total < float(s["price_min"]):
-        return await cq.message.answer(f"💳 Low balance ({total:.2f} {s['currency'].upper()})")
+    if wallet is None:
+        total = await lzt.balance_total(s["currency"])
+        return await cq.message.answer(
+            f"💳 Low market balance {fmt_money(total, s['currency'])} — top up or run /walletdebug")
+
     try:
         items = await lzt.search(s)
     except LztError as e:
         return await cq.message.answer(f"❌ Search failed: {e}")
+
     for it in items[:40]:
         if not passes(it, s)[0]:
             continue

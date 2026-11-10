@@ -1,4 +1,4 @@
-"""Buy loop + expiry worker."""
+"""Buy loop + expiry worker, with live balance guard."""
 import asyncio
 import logging
 import time
@@ -23,6 +23,16 @@ async def _notify(bot, tg_id, text):
 async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
     item_id = item["item_id"]
     price = float(item["price"])
+
+    try:
+        available = await lzt.balance_total(s["currency"])
+    except LztError as e:
+        log.info(f"balance check: {e}")
+        return None
+    if available < price:
+        await _notify(bot, tg_id, f"💳 Balance {available:.2f} < {price:.2f} — buy skipped")
+        return None
+
     try:
         chk = await lzt.check_account(item_id)
     except LztError as e:
@@ -115,11 +125,19 @@ async def buy_loop(bot, lzt):
                 if await db.spent_today(tg_id) >= float(s["daily_spend_cap"]):
                     continue
                 try:
+                    if await lzt.balance_total(s["currency"]) < float(s["price_min"]):
+                        await asyncio.sleep(float(s["poll_interval"]))
+                        continue
+                except LztError:
+                    pass
+
+                try:
                     items = await lzt.search(s)
                 except LztError as e:
                     log.info(f"search: {e}")
                     await asyncio.sleep(10)
                     continue
+
                 bought = 0
                 for it in items[:40]:
                     if not passes(it, s)[0]:

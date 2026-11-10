@@ -1,1 +1,7 @@
- 
+aiogram==3.13.1
+httpx==0.27.2
+pymongo==4.13.2
+dnspython==2.7.0
+telethon==1.36.0
+python-dotenv==1.0.1
+PySocks==1.7.1

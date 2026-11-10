@@ -30,4 +30,8 @@ SEARCH_DELAY: float = 3.0
 TICK: float = 15.0
 CODE_TIMEOUT: int = 180
 
+# live API cache — GET endpoints are 300/min, keep UI snappy without spamming
+CACHE_TTL: float = 20.0
+PAYMENTS_PAGE: int = 10
+
 QUICK_COUNTRIES = ["AE", "LY", "JO", "EG", "IQ", "SA", "KW", "QA", "SD", "YE", "MA", "DZ"]

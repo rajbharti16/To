@@ -42,7 +42,7 @@ def _one(entry: dict, fallback_currency: str = "usd") -> dict:
 
 
 def parse_balances(payload: dict) -> list[dict]:
-    """Parse LZT /balance/exchange response."""
+    """Parse LZT balance response with converted values."""
     payload = payload or {}
     out = []
 
@@ -53,14 +53,16 @@ def parse_balances(payload: dict) -> list[dict]:
             if not isinstance(item, dict):
                 continue
 
-            balance_id = item.get("balance_id", key)
-            title = item.get("custom_title") or item.get("title") or key
-
             out.append({
-                "balance_id": balance_id,
-                "currency": str(title),
+                "balance_id": item.get("balance_id", key),
+                "currency": (
+                    item.get("custom_title")
+                    or item.get("title")
+                    or str(key)
+                ),
                 "amount": _num(item.get("balance")),
                 "hold": _num(item.get("hold")),
+                "converted_amount": _num(item.get("convertedBalance")),
             })
 
     return out

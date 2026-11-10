@@ -33,11 +33,8 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
         return None
 
     if wallet is None:
-        try:
-            have = await lzt.balance_total(currency)
-            any_total = total_any(await lzt.balances(), currency)
-        except LztError:
-            have = any_total = 0.0
+        have = await lzt.balance_total(currency)
+        any_total = total_any(await lzt.balances(), currency)
         hint = f" (TG-only {fmt_money(any_total, currency)})" if any_total > have else ""
         await _notify(bot, tg_id,
                       f"💳 Insufficient market balance {fmt_money(have, currency)} "

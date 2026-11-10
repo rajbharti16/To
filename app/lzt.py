@@ -5,7 +5,7 @@ import time
 import httpx
 
 from app.config import CACHE_TTL, HTTP_TIMEOUT, LZT_BASE, LZT_TOKEN, SEARCH_DELAY
-from app.utils.money import parse_balances, parse_user
+from app.utils.money import parse_balances, parse_user, pick_for_buy, spendable
 
 
 class LztError(Exception):
@@ -42,6 +42,10 @@ class LztClient:
     def _store(self, key: str, value):
         self._cache[key] = (time.time(), value)
         return value
+
+    def invalidate_wallet(self):
+        self._cache.pop("balances", None)
+        self._cache.pop("profile", None)
 
     async def _req(self, method: str, path: str, **kw):
         for attempt in range(4):
@@ -88,18 +92,18 @@ class LztClient:
         return await self._req("GET", "/balance/exchange")
 
     async def balances(self) -> list[dict]:
-        """Normalised balance list: [{balance_id, currency, amount, hold}]."""
         cached = self._cached("balances")
         if cached is not None:
             return cached
         return self._store("balances", parse_balances(await self.balances_raw()))
 
     async def balance_total(self, currency: str = "usd") -> float:
-        """Available amount in the given currency (0.0 when absent)."""
-        for b in await self.balances():
-            if b["currency"].lower() == currency.lower():
-                return max(0.0, b["amount"] - b["hold"])
-        return 0.0
+        """Spendable (market, non-TG) free amount in the given currency."""
+        return spendable(await self.balances(), currency)
+
+    async def balance_for_buy(self, currency: str, price: float) -> dict | None:
+        """Balance entry that can cover `price`, or None."""
+        return pick_for_buy(await self.balances(), currency, price)
 
     async def currency(self) -> dict:
         cached = self._cached("currency")
@@ -112,8 +116,7 @@ class LztClient:
             "POST", "/balance/exchange",
             json={"from_balance": from_balance, "to_balance": to_balance, "amount": amount},
         )
-        self._cache.pop("balances", None)
-        self._cache.pop("profile", None)
+        self.invalidate_wallet()
         return res
 
     async def payments(self, page: int = 1, operation_type: str | None = None) -> list[dict]:
@@ -165,8 +168,7 @@ class LztClient:
         for attempt in range(6):
             try:
                 res = await self._req("POST", f"/{item_id}/fast-buy", json=body)
-                self._cache.pop("balances", None)
-                self._cache.pop("profile", None)
+                self.invalidate_wallet()
                 return res
             except LztError as e:
                 if e.retryable and attempt < 5:

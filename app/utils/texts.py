@@ -1,4 +1,5 @@
-"""Message formatting — prices only in body text, never on buttons."""
+"""Message formatting for AccStore dashboard."""
+
 from app.utils.money import fmt_money
 
 
@@ -8,24 +9,39 @@ def wallet_text(profile: dict, balances: list[dict]) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━",
         f"👤 <b>{profile.get('username', '?')}</b> · id <code>{profile.get('user_id', 0)}</code>",
         f"💬 Sympathies: {int(profile.get('sympathies', 0))}",
+        "",
     ]
+
     if balances:
         for b in balances:
-            free = b["amount"] - b["hold"]
-            line = f"• {b['currency'].upper()}: <b>{fmt_money(free, b['currency'])}</b>"
-            if b["hold"]:
-                line += f" (hold {fmt_money(b['hold'], b['currency'])})"
-            lines.append(line)
+            amount = b["amount"]
+            hold = b["hold"]
+            converted = b.get("converted_amount", 0)
+
+            # Approximate USDT equivalent using API conversion.
+            free = max(0, amount - hold)
+            usdt = converted * (free / amount) if amount > 0 else 0
+
+            lines.append(
+                f"• <b>{b['currency'].upper()}</b>: "
+                f"<b>{usdt:,.2f} USDT</b>"
+            )
+
+            if hold:
+                lines.append(f"  Hold: {hold:,.2f} (original units)")
     else:
-        lines.append("• no balances returned")
+        lines.append("• No balances returned")
+
     return "\n".join(lines)
 
 
 def menu_text(s: dict, profile: dict, balances: list[dict]) -> str:
     head = " · ".join(
-        f"{b['currency'].upper()} {fmt_money(b['amount'] - b['hold'], b['currency'])}"
+        f"{b['currency'].upper()} "
+        f"{b.get('converted_amount', 0):,.2f} USDT"
         for b in balances
     ) or "n/a"
+
     return (
         "🎛 <b>AccStore — LZT Auto Buyer</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -53,6 +69,7 @@ def stats_text(st: dict) -> str:
 
 def payment_text(p: dict) -> str:
     sign = "+" if (p.get("operation_type") or "") in ("income", "incoming") else "−"
+
     return (
         f"{sign} {fmt_money(abs(float(p.get('amount') or 0)), p.get('currency') or 'usd')}"
         f" · <code>{p.get('operation_type') or 'op'}</code>"

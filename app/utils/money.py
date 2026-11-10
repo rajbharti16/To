@@ -1,4 +1,4 @@
-"""Defensive parsers + currency normalisation for LZT profile / balance payloads."""
+"""Balance/profile parsing that survives unknown payload shapes."""
 from decimal import Decimal, InvalidOperation
 
 SYMBOLS = {"usd": "$", "eur": "€", "rub": "₽", "uah": "₴", "gbp": "£",
@@ -7,8 +7,13 @@ SYMBOLS = {"usd": "$", "eur": "€", "rub": "₽", "uah": "₴", "gbp": "£",
 ALIASES = {"usdt": "usd", "usdc": "usd", "busd": "usd", "usdtt": "usd",
            "rubr": "rub", "eurc": "eur"}
 
-TELEGRAM_MARKERS = ("telegram", "tg_", "tg-", "tg ")
-MARKET_MARKERS = ("market", "trade")
+TELEGRAM_MARKERS = ("telegram", "tg", "wallet")
+MARKET_MARKERS = ("market", "main", "trade", "spend")
+
+CUR_KEYS = ("currency", "cur", "code", "currency_code")
+AMT_KEYS = ("balance", "amount", "value", "sum", "available", "free")
+HOLD_KEYS = ("hold", "held", "frozen", "pending", "locked")
+ID_KEYS = ("balance_id", "id", "wallet_id", "balanceid")
 
 
 def canon(currency: str) -> str:
@@ -20,7 +25,7 @@ def same_currency(a: str, b: str) -> bool:
     return canon(a) == canon(b)
 
 
-def _num(v, default=0.0) -> float:
+def _num(v, default=None):
     try:
         return float(Decimal(str(v)))
     except (InvalidOperation, TypeError, ValueError):
@@ -40,65 +45,89 @@ def parse_user(payload: dict) -> dict:
         "user_id": u.get("user_id") or u.get("id") or 0,
         "username": u.get("username") or "?",
         "currency": canon(u.get("currency")),
-        "balance": _num(u.get("balance")),
-        "hold": _num(u.get("hold")),
-        "sympathies": _num(u.get("sympathies")),
-        "like_count": _num(u.get("like_count")),
-        "items_count": _num(u.get("items_count")),
+        "balance": _num(u.get("balance"), 0.0),
+        "hold": _num(u.get("hold"), 0.0),
+        "sympathies": _num(u.get("sympathies"), 0.0),
+        "like_count": _num(u.get("like_count"), 0.0),
+        "items_count": _num(u.get("items_count"), 0.0),
     }
 
 
-def _kind(entry: dict) -> str:
-    """Cosmetic label only — never gates spendability."""
-    raw = " ".join(
-        str(entry.get(k) or "").lower()
-        for k in ("type", "balance_type", "name", "title", "slug", "label")
-    )
-    if any(m in raw for m in MARKET_MARKERS):
-        return "market"
+def _is_currency(v) -> bool:
+    return isinstance(v, str) and 2 <= len(v) <= 5 and v.replace("_", "").isalpha()
+
+
+def _pick(d: dict, keys) -> tuple[str | None, object]:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return k, d[k]
+    return None, None
+
+
+def _kind(d: dict) -> str:
+    raw = " ".join(str(v).lower() for v in d.values() if isinstance(v, (str, int, float)))
     if any(m in raw for m in TELEGRAM_MARKERS):
         return "telegram"
+    if any(m in raw for m in MARKET_MARKERS):
+        return "market"
     return "other"
 
 
-def _one(entry: dict, fallback_currency: str = "usd") -> dict:
+def _label(d: dict) -> str:
+    for k in ("title", "name", "label", "type", "balance_type", "slug", "description"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip() and not _is_currency(v):
+            return v.strip()[:24]
+    return ""
+
+
+def _entry(d: dict, currency: str) -> dict:
+    kind = _kind(d)
+    _, hold = _pick(d, HOLD_KEYS)
+    _, bid = _pick(d, ID_KEYS)
     return {
-        "balance_id": int(_num(entry.get("balance_id") or entry.get("id"))),
-        "currency": (entry.get("currency") or fallback_currency or "usd").lower(),
-        "amount": _num(entry.get("balance") or entry.get("amount") or entry.get("value")),
-        "hold": _num(entry.get("hold")),
-        "kind": _kind(entry),
+        "balance_id": int(_num(bid, 0) or 0),
+        "currency": currency.lower(),
+        "amount": _num(_pick(d, AMT_KEYS)[1], 0.0),
+        "hold": _num(hold, 0.0),
+        "kind": kind,
+        "label": _label(d) or {"market": "Market balance", "telegram": "TG wallet"}.get(kind, "Balance"),
+        "usable_for_buy": kind != "telegram",
     }
 
 
+def _walk(node, out: list, depth: int = 0):
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        _, cur = _pick(node, CUR_KEYS)
+        if _is_currency(cur) and _pick(node, AMT_KEYS)[1] is not None:
+            out.append(_entry(node, cur))
+            return
+        for v in node.values():
+            _walk(v, out, depth + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _walk(v, out, depth + 1)
+
+
 def parse_balances(payload: dict) -> list[dict]:
-    """
-    Normalise any balance-ish payload. Order of attempts:
-      balances/wallets list → dict of currency → user object → payload root.
-    """
-    payload = payload or {}
+    """Find every {currency, amount} object anywhere in the payload, deduped."""
     out: list[dict] = []
+    _walk(payload or {}, out)
 
-    raw = payload.get("balances") or payload.get("wallets")
-    if isinstance(raw, list):
-        out = [_one(e) for e in raw if isinstance(e, dict)]
-    elif isinstance(raw, dict):
-        for cur, val in raw.items():
-            if isinstance(val, dict):
-                out.append(_one(val, cur))
-            else:
-                out.append({"balance_id": 0, "currency": cur.lower(), "amount": _num(val),
-                            "hold": 0.0, "kind": "other"})
+    seen, unique = set(), []
+    for b in out:
+        key = (b["balance_id"], b["currency"], round(b["amount"], 6), b["kind"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(b)
 
-    if not out:
-        user = payload.get("user")
-        if isinstance(user, dict) and ("balance" in user or "hold" in user):
-            out = [_one(user)]
-
-    if not out and any(k in payload for k in ("balance", "hold", "currency")):
-        out = [_one(payload)]
-
-    return [b for b in out if b["currency"]]
+    if not unique:
+        user = (payload or {}).get("user") or {}
+        if _is_currency(user.get("currency")) and user.get("balance") is not None:
+            unique = [_entry(user, user["currency"])]
+    return unique
 
 
 def _rank(b: dict) -> tuple:
@@ -107,19 +136,19 @@ def _rank(b: dict) -> tuple:
 
 
 def spendable(balances: list[dict], currency: str) -> float:
-    """Free amount in that currency across every balance."""
+    return sum(max(0.0, b["amount"] - b["hold"])
+               for b in balances
+               if b["usable_for_buy"] and same_currency(b["currency"], currency))
+
+
+def total_any(balances: list[dict], currency: str) -> float:
     return sum(max(0.0, b["amount"] - b["hold"])
                for b in balances if same_currency(b["currency"], currency))
 
 
 def pick_for_buy(balances: list[dict], currency: str, price: float) -> dict | None:
-    """Cheapest-risk balance able to cover `price` (market labels preferred)."""
-    candidates = [
-        b for b in sorted(balances, key=_rank)
-        if same_currency(b["currency"], currency) and (b["amount"] - b["hold"]) >= price
-    ]
-    return candidates[0] if candidates else None
-
-
-def total_any(balances: list[dict], currency: str) -> float:
-    return spendable(balances, currency)
+    """Best balance covering `price`. Market first, telegram never."""
+    cands = [b for b in sorted(balances, key=_rank)
+             if b["usable_for_buy"] and same_currency(b["currency"], currency)
+             and (b["amount"] - b["hold"]) >= price]
+    return cands[0] if cands else None

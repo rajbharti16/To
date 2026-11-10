@@ -9,6 +9,7 @@ from app.lzt import LztError
 from app.mail_engine import TempMailClient
 from app.session_manager import change_email, client, login_with_lzt, terminate
 from app.utils.filters import country_of, passes, phone_of
+from app.utils.money import fmt_money, total_any
 
 log = logging.getLogger("engine")
 
@@ -23,14 +24,24 @@ async def _notify(bot, tg_id, text):
 async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
     item_id = item["item_id"]
     price = float(item["price"])
+    currency = s["currency"]
 
     try:
-        available = await lzt.balance_total(s["currency"])
+        wallet = await lzt.balance_for_buy(currency, price)
     except LztError as e:
         log.info(f"balance check: {e}")
         return None
-    if available < price:
-        await _notify(bot, tg_id, f"💳 Balance {available:.2f} < {price:.2f} — buy skipped")
+
+    if wallet is None:
+        try:
+            have = await lzt.balance_total(currency)
+            any_total = total_any(await lzt.balances(), currency)
+        except LztError:
+            have = any_total = 0.0
+        hint = f" (TG-only {fmt_money(any_total, currency)})" if any_total > have else ""
+        await _notify(bot, tg_id,
+                      f"💳 Insufficient market balance {fmt_money(have, currency)} "
+                      f"for {fmt_money(price, currency)}{hint}")
         return None
 
     try:
@@ -42,7 +53,7 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
         return None
 
     try:
-        res = await lzt.fast_buy(item_id, price)
+        res = await lzt.fast_buy(item_id, price, balance_id=wallet["balance_id"] or None)
     except LztError as e:
         log.info(f"buy {item_id}: {e}")
         return None
@@ -120,10 +131,12 @@ async def buy_loop(bot, lzt):
             for u in await db.all_owners():
                 tg_id = u["_id"]
                 s = await db.get_settings(tg_id)
+
                 if s["auto_buy"] != "1":
                     continue
                 if await db.spent_today(tg_id) >= float(s["daily_spend_cap"]):
                     continue
+
                 try:
                     if await lzt.balance_total(s["currency"]) < float(s["price_min"]):
                         await asyncio.sleep(float(s["poll_interval"]))

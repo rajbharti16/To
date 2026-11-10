@@ -33,19 +33,41 @@ def _oid(pid):
         return None
 
 
+# --- pymongo-async cursor helpers -------------------------------------------
+# aggregate() is a coroutine in the async API and resolves to a cursor, while
+# find() returns the cursor directly. These helpers keep that asymmetry in one
+# place instead of scattering `await` in the wrong spot.
+
+async def _agg_one(collection, pipeline: list) -> dict | None:
+    cursor = await collection.aggregate(pipeline)
+    rows = await cursor.to_list(1)
+    return rows[0] if rows else None
+
+
+async def _find_all(cursor, limit=None) -> list[dict]:
+    return await cursor.to_list(limit)
+
+
+# ---------------------------------------------------------------------------
+
 async def init_db():
     global _client, _db
     _client = AsyncMongoClient(MONGO_URI)
     _db = _client[MONGO_DB]
     await _db.purchases.create_index([("status", ASCENDING), ("expires_at", ASCENDING)])
-    await _db.purchases.create_index([("tg_id", ASCENDING)])
+    await _db.purchases.create_index([("tg_id", ASCENDING), ("started_at", ASCENDING)])
+    await _db.purchases.create_index([("tg_id", ASCENDING), ("status", ASCENDING)])
     await _db.ledger.create_index([("tg_id", ASCENDING), ("created_at", ASCENDING)])
+    await _db.ledger.create_index([("purchase_id", ASCENDING)])
     await _db.settings.create_index([("tg_id", ASCENDING)], unique=True)
 
 
 async def close_db():
+    global _client, _db
     if _client:
         await _client.close()
+    _client = None
+    _db = None
 
 
 async def ensure_user(tg_id: int, username: str = ""):
@@ -62,7 +84,9 @@ async def ensure_user(tg_id: int, username: str = ""):
 async def get_settings(tg_id: int) -> dict:
     doc = await _db.settings.find_one({"tg_id": tg_id})
     if not doc:
-        await _db.settings.insert_one({**DEFAULTS, "tg_id": tg_id})
+        await _db.settings.update_one(
+            {"tg_id": tg_id}, {"$setOnInsert": {**DEFAULTS, "tg_id": tg_id}}, upsert=True
+        )
         return dict(DEFAULTS)
     doc.pop("_id", None)
     doc.pop("tg_id", None)
@@ -70,19 +94,21 @@ async def get_settings(tg_id: int) -> dict:
 
 
 async def set_setting(tg_id: int, key: str, value: str):
-    await _db.settings.update_one({"tg_id": tg_id}, {"$set": {key: str(value)}}, upsert=True)
+    await _db.settings.update_one(
+        {"tg_id": tg_id}, {"$set": {key: str(value)}}, upsert=True
+    )
 
 
 async def all_owners() -> list[dict]:
-    return await _db.users.find({}, {"_id": 1}).to_list(None)
+    return await _find_all(_db.users.find({}, {"_id": 1}))
 
 
 async def spent_today(tg_id: int) -> float:
-    res = await _db.purchases.aggregate([
+    row = await _agg_one(_db.purchases, [
         {"$match": {"tg_id": tg_id, "started_at": {"$gte": _now() - 86400}}},
         {"$group": {"_id": None, "s": {"$sum": "$price"}}},
-    ]).to_list(1)
-    return float(res[0]["s"]) if res else 0.0
+    ])
+    return float(row["s"]) if row else 0.0
 
 
 async def add_purchase(tg_id, item_id, phone, country, price, mail="", mail_password="",
@@ -103,14 +129,15 @@ async def add_purchase(tg_id, item_id, phone, country, price, mail="", mail_pass
 
 
 async def due_purchases() -> list[dict]:
-    return await _db.purchases.find(
+    return await _find_all(_db.purchases.find(
         {"status": "active", "expires_at": {"$gt": 0, "$lte": _now()}}
-    ).to_list(None)
+    ))
 
 
 async def active_purchases(tg_id: int) -> list[dict]:
-    return await _db.purchases.find({"tg_id": tg_id, "status": "active"}) \
-        .sort("expires_at", ASCENDING).to_list(None)
+    return await _find_all(
+        _db.purchases.find({"tg_id": tg_id, "status": "active"}).sort("expires_at", ASCENDING)
+    )
 
 
 async def get_purchase(pid) -> dict | None:
@@ -121,7 +148,9 @@ async def get_purchase(pid) -> dict | None:
 async def set_session(pid, session_string: str):
     oid = _oid(pid)
     if oid:
-        await _db.purchases.update_one({"_id": oid}, {"$set": {"session_string": session_string}})
+        await _db.purchases.update_one(
+            {"_id": oid}, {"$set": {"session_string": session_string}}
+        )
 
 
 async def close_purchase(pid, status: str, note: str = "", new_mail: str = ""):
@@ -149,20 +178,38 @@ async def mark_sold(pid, sell_price: float):
 
 
 async def ledger_rows(tg_id: int) -> list[dict]:
-    return await _db.ledger.find({"tg_id": tg_id}).sort("_id", -1).limit(500).to_list(None)
+    return await _find_all(_db.ledger.find({"tg_id": tg_id}).sort("_id", -1).limit(500))
 
 
 async def ledger_stats(tg_id: int) -> dict:
-    res = await _db.ledger.aggregate([
+    # Single round trip: totals and the "done" count come back in one $facet.
+    row = await _agg_one(_db.ledger, [
         {"$match": {"tg_id": tg_id}},
-        {"$group": {"_id": None, "total": {"$sum": 1},
-                    "spent": {"$sum": "$buy_price"}, "revenue": {"$sum": "$sell_price"}}},
-    ]).to_list(1)
-    row = res[0] if res else {"total": 0, "spent": 0.0, "revenue": 0.0}
-    spent, revenue = float(row["spent"]), float(row["revenue"])
+        {"$facet": {
+            "agg": [
+                {"$group": {"_id": None, "total": {"$sum": 1},
+                            "spent": {"$sum": "$buy_price"},
+                            "revenue": {"$sum": "$sell_price"}}},
+            ],
+            "done": [
+                {"$match": {"status": {"$in": ["terminated", "sold"]}}},
+                {"$count": "n"},
+            ],
+        }},
+    ])
+
+    agg = (row or {}).get("agg") or [{}]
+    agg = agg[0]
+    done = ((row or {}).get("done") or [{}])[0].get("n", 0)
+
+    spent = float(agg.get("spent", 0.0) or 0.0)
+    revenue = float(agg.get("revenue", 0.0) or 0.0)
     profit = revenue - spent
-    done = await _db.ledger.count_documents(
-        {"tg_id": tg_id, "status": {"$in": ["terminated", "sold"]}}
-    )
-    return {"total": int(row["total"]), "spent": spent, "revenue": revenue,
-            "profit": profit, "roi": (profit / spent * 100) if spent else 0.0, "done": done}
+    return {
+        "total": int(agg.get("total", 0) or 0),
+        "spent": spent,
+        "revenue": revenue,
+        "profit": profit,
+        "roi": (profit / spent * 100) if spent else 0.0,
+        "done": int(done),
+    }

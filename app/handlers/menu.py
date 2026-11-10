@@ -24,19 +24,29 @@ async def show(cq: CallbackQuery, text: str, markup):
         await cq.message.answer(text, reply_markup=markup)
 
 
+async def live_state():
+    """Profile + balances, both degrade to safe defaults on API failure."""
+    try:
+        return await lzt.profile(), await lzt.balances()
+    except LztError:
+        return {"username": "unreachable", "user_id": 0, "sympathies": 0}, []
+
+
 @router.message(Command("start"))
 async def cmd_start(m: Message):
     if not allowed(m.from_user.id):
         return await m.answer(f"⛔️ Not allowed. Your id: <code>{m.from_user.id}</code>")
     await db.ensure_user(m.from_user.id, m.from_user.username or "")
     s = await db.get_settings(m.from_user.id)
-    await m.answer(menu_text(s), reply_markup=kb.main(s))
+    profile, balances = await live_state()
+    await m.answer(menu_text(s, profile, balances), reply_markup=kb.main(s, balances))
 
 
 @router.callback_query(F.data == "m:main")
 async def cb_main(cq: CallbackQuery):
     s = await db.get_settings(cq.from_user.id)
-    await show(cq, menu_text(s), kb.main(s))
+    profile, balances = await live_state()
+    await show(cq, menu_text(s, profile, balances), kb.main(s, balances))
     await cq.answer()
 
 
@@ -47,7 +57,10 @@ async def cb_toggle(cq: CallbackQuery):
     new = "0" if s[key] == "1" else "1"
     await db.set_setting(cq.from_user.id, key, new)
     s = await db.get_settings(cq.from_user.id)
-    await show(cq, menu_text(s), kb.main(s) if key == "auto_buy" else kb.filters(s))
+    if key == "auto_buy":
+        profile, balances = await live_state()
+        return await show(cq, menu_text(s, profile, balances), kb.main(s, balances))
+    await show(cq, "🎛 <b>Filters</b>", kb.filters(s))
     await cq.answer(f"{key}: {'ON' if new == '1' else 'OFF'}")
 
 
@@ -55,6 +68,12 @@ async def cb_toggle(cq: CallbackQuery):
 async def cb_go(cq: CallbackQuery):
     await cq.answer("scanning…")
     s = await db.get_settings(cq.from_user.id)
+    try:
+        total = await lzt.balance_total(s["currency"])
+    except LztError as e:
+        return await cq.message.answer(f"❌ Balance unavailable: {e}")
+    if total < float(s["price_min"]):
+        return await cq.message.answer(f"💳 Low balance ({total:.2f} {s['currency'].upper()})")
     try:
         items = await lzt.search(s)
     except LztError as e:

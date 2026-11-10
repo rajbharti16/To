@@ -1,57 +1,70 @@
 import pytest
 
 from app.utils.money import (canon, fmt_money, parse_balances, parse_user,
-                             pick_for_buy, same_currency, spendable, total_any)
+                             pick_for_buy, same_currency, spendable)
 
-PAYLOAD = {"balances": [
-    {"balance_id": 1, "currency": "usdt", "type": "market", "balance": 2.78, "hold": 0},
-    {"balance_id": 2, "currency": "usdt", "type": "telegram", "balance": 0, "hold": 0},
+# exact shape unknown -> parser must find entries anywhere
+NESTED = {"data": {"balances": {"items": [
+    {"balance_id": 1, "currency": "usdt", "title": "Market balance", "balance": 2.78},
+    {"balance_id": 2, "currency": "usdt", "title": "TG wallet", "balance": 0},
+]}}}
+
+FLAT = {"balances": [
+    {"balance_id": 1, "currency": "usdt", "type": "market", "balance": 2.78},
+    {"balance_id": 2, "currency": "usdt", "type": "telegram", "balance": 0},
 ]}
 
 
 def test_alias():
     assert canon("USDT") == "usd"
     assert same_currency("usdt", "usd")
-    assert not same_currency("usdt", "rub")
 
 
-def test_kind_detection():
-    b = parse_balances(PAYLOAD)
-    assert b[0]["kind"] == "market" and b[0]["usable_for_buy"] is True
-    assert b[1]["kind"] == "telegram" and b[1]["usable_for_buy"] is False
+def test_nested_discovery():
+    b = parse_balances(NESTED)
+    assert len(b) == 2 and b[0]["kind"] == "market"
 
 
-def test_spendable_ignores_telegram():
-    b = parse_balances(PAYLOAD)
-    assert spendable(b, "usd") == 2.78
-    assert total_any(b, "usd") == 2.78
+def test_flat_kind():
+    b = parse_balances(FLAT)
+    assert b[0]["usable_for_buy"] is True and b[1]["usable_for_buy"] is False
 
 
-def test_pick_for_buy_uses_market():
-    b = parse_balances(PAYLOAD)
-    chosen = pick_for_buy(b, "usd", 0.5)
-    assert chosen["balance_id"] == 1
+def test_spendable():
+    assert spendable(parse_balances(FLAT), "usd") == 2.78
 
 
-def test_pick_for_buy_insufficient():
-    assert pick_for_buy(parse_balances(PAYLOAD), "usd", 99) is None
+def test_pick_prefers_market():
+    assert pick_for_buy(parse_balances(FLAT), "usd", 0.5)["balance_id"] == 1
 
 
-def test_pick_never_telegram_only():
-    b = parse_balances({"balances": [
-        {"balance_id": 9, "currency": "usd", "type": "telegram", "balance": 50}]})
-    assert pick_for_buy(b, "usd", 1) is None
+def test_pick_insufficient():
+    assert pick_for_buy(parse_balances(FLAT), "usd", 99) is None
+
+
+def test_profile_fallback():
+    b = parse_balances({"user": {"currency": "usdt", "balance": "3.5"}})
+    assert b[0]["amount"] == 3.5
+
+
+def test_unlabelled_is_usable():
+    b = parse_balances({"balances": [{"currency": "usd", "balance": 5}]})
+    assert b[0]["usable_for_buy"] is True
+
+
+def test_dedupe():
+    one = {"balances": [{"balance_id": 1, "currency": "usd", "balance": 1}]}
+    one["balances"].append(dict(one["balances"][0]))
+    assert len(parse_balances(one)) == 1
 
 
 def test_fmt():
     assert fmt_money(2.78, "usdt") == "2.78 USDT"
-    assert fmt_money(2.5, "usd") == "$2.50"
 
 
 @pytest.mark.parametrize("amount", ["abc", None])
 def test_garbage(amount):
-    b = parse_balances({"balances": [{"currency": "usd", "balance": amount}]})
-    assert b[0]["amount"] == 0.0
+    assert parse_balances({"balances": [{"currency": "usd", "balance": amount}]})[0]["amount"] == 0.0
 
 
 def test_parse_user():

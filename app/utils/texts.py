@@ -1,6 +1,9 @@
-"""Message formatting for AccStore dashboard."""
-
+"""Message formatting — prices only in body text, never on buttons."""
 from app.utils.money import fmt_money
+
+
+def _kind_label(kind: str) -> str:
+    return {"market": "MARKET", "telegram": "TG"}.get(kind, "OTHER")
 
 
 def wallet_text(profile: dict, balances: list[dict]) -> str:
@@ -9,39 +12,27 @@ def wallet_text(profile: dict, balances: list[dict]) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━",
         f"👤 <b>{profile.get('username', '?')}</b> · id <code>{profile.get('user_id', 0)}</code>",
         f"💬 Sympathies: {int(profile.get('sympathies', 0))}",
-        "",
     ]
-
     if balances:
         for b in balances:
-            amount = b["amount"]
-            hold = b["hold"]
-            converted = b.get("converted_amount", 0)
-
-            # Approximate USDT equivalent using API conversion.
-            free = max(0, amount - hold)
-            usdt = converted * (free / amount) if amount > 0 else 0
-
-            lines.append(
-                f"• <b>{b['currency'].upper()}</b>: "
-                f"<b>{usdt:,.2f} USDT</b>"
-            )
-
-            if hold:
-                lines.append(f"  Hold: {hold:,.2f} (original units)")
+            free = b["amount"] - b["hold"]
+            line = f"• {_kind_label(b['kind'])} <b>{fmt_money(free, b['currency'])}</b>"
+            if not b["usable_for_buy"]:
+                line += " · not usable for buys"
+            if b["hold"]:
+                line += f" (hold {fmt_money(b['hold'], b['currency'])})"
+            lines.append(line)
     else:
-        lines.append("• No balances returned")
-
+        lines.append("• no balances returned")
     return "\n".join(lines)
 
 
 def menu_text(s: dict, profile: dict, balances: list[dict]) -> str:
+    market = [b for b in balances if b["usable_for_buy"]]
     head = " · ".join(
-        f"{b['currency'].upper()} "
-        f"{b.get('converted_amount', 0):,.2f} USDT"
-        for b in balances
-    ) or "n/a"
-
+        f"{_kind_label(b['kind'])} {fmt_money(b['amount'] - b['hold'], b['currency'])}"
+        for b in market
+    ) or "no market balance"
     return (
         "🎛 <b>AccStore — LZT Auto Buyer</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -69,7 +60,6 @@ def stats_text(st: dict) -> str:
 
 def payment_text(p: dict) -> str:
     sign = "+" if (p.get("operation_type") or "") in ("income", "incoming") else "−"
-
     return (
         f"{sign} {fmt_money(abs(float(p.get('amount') or 0)), p.get('currency') or 'usd')}"
         f" · <code>{p.get('operation_type') or 'op'}</code>"

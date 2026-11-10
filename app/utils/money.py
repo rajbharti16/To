@@ -42,28 +42,25 @@ def _one(entry: dict, fallback_currency: str = "usd") -> dict:
 
 
 def parse_balances(payload: dict) -> list[dict]:
-    """
-    Normalise GET /balance/exchange. Handles:
-      {"balances": [{balance_id, currency, balance, hold}]}
-      {"balances": {"usd": 12.5, "rub": 900}}
-      {"user": {"balance": ..., "currency": ...}}
-    """
+    """Parse LZT /balance/exchange response."""
     payload = payload or {}
-    out: list[dict] = []
+    out = []
 
-    raw = payload.get("balances") or payload.get("wallets")
-    if isinstance(raw, list):
-        out = [_one(e) for e in raw if isinstance(e, dict)]
-    elif isinstance(raw, dict):
-        for cur, val in raw.items():
-            if isinstance(val, dict):
-                out.append(_one(val, cur))
-            else:
-                out.append({"balance_id": 0, "currency": cur.lower(), "amount": _num(val), "hold": 0.0})
+    raw = payload.get("to") or payload.get("from") or {}
 
-    if not out:
-        user = payload.get("user") or {}
-        if user:
-            out = [_one(user)]
+    if isinstance(raw, dict):
+        for key, item in raw.items():
+            if not isinstance(item, dict):
+                continue
 
-    return [b for b in out if b["currency"]]
+            balance_id = item.get("balance_id", key)
+            title = item.get("custom_title") or item.get("title") or key
+
+            out.append({
+                "balance_id": balance_id,
+                "currency": str(title),
+                "amount": _num(item.get("balance")),
+                "hold": _num(item.get("hold")),
+            })
+
+    return out

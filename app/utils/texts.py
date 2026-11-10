@@ -2,10 +2,6 @@
 from app.utils.money import fmt_money
 
 
-def _kind_label(kind: str) -> str:
-    return {"market": "MARKET", "telegram": "TG"}.get(kind, "OTHER")
-
-
 def wallet_text(profile: dict, balances: list[dict]) -> str:
     lines = [
         "💳 <b>Wallet</b>",
@@ -16,23 +12,25 @@ def wallet_text(profile: dict, balances: list[dict]) -> str:
     if balances:
         for b in balances:
             free = b["amount"] - b["hold"]
-            line = f"• {_kind_label(b['kind'])} <b>{fmt_money(free, b['currency'])}</b>"
+            line = f"• <b>{b['label']}</b> {fmt_money(free, b['currency'])}"
             if not b["usable_for_buy"]:
-                line += " · not usable for buys"
+                line += " · not usable"
             if b["hold"]:
                 line += f" (hold {fmt_money(b['hold'], b['currency'])})"
             lines.append(line)
     else:
-        lines.append("• no balances returned")
+        prof_bal = profile.get("balance", 0.0) - profile.get("hold", 0.0)
+        lines.append(f"• profile balance {fmt_money(prof_bal, profile.get('currency', 'usd'))}")
     return "\n".join(lines)
 
 
 def menu_text(s: dict, profile: dict, balances: list[dict]) -> str:
-    market = [b for b in balances if b["usable_for_buy"]]
-    head = " · ".join(
-        f"{_kind_label(b['kind'])} {fmt_money(b['amount'] - b['hold'], b['currency'])}"
-        for b in market
-    ) or "no market balance"
+    usable = [b for b in balances if b["usable_for_buy"]]
+    if usable:
+        head = " · ".join(f"{fmt_money(b['amount'] - b['hold'], b['currency'])}" for b in usable)
+    else:
+        prof_bal = profile.get("balance", 0.0) - profile.get("hold", 0.0)
+        head = fmt_money(prof_bal, profile.get("currency", s["currency"]))
     return (
         "🎛 <b>AccStore — LZT Auto Buyer</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"

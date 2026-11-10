@@ -3,6 +3,7 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.config import QUICK_COUNTRIES
+from app.utils.money import fmt_money
 
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -14,13 +15,36 @@ def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def main(s: dict) -> InlineKeyboardMarkup:
-    return kb([
+def main(s: dict, balances: list[dict] | None = None) -> InlineKeyboardMarkup:
+    rows = [
         [("▶️ Start Auto-Buy" if s["auto_buy"] != "1" else "⏸ Stop Auto-Buy", "t:auto_buy")],
-        [("🎛 Filters", "m:filters"), ("🧾 Sessions", "m:sessions")],
-        [("📊 Ledger", "m:ledger"), ("📈 Stats", "m:stats")],
-        [("🔄 Buy One Now", "go")],
-    ])
+        [("💳 Wallet", "m:wallet"), ("🎛 Filters", "m:filters")],
+        [("🧾 Sessions", "m:sessions"), ("📊 Ledger", "m:ledger")],
+        [("📈 Stats", "m:stats"), ("🔄 Buy One Now", "go")],
+    ]
+    return kb(rows)
+
+
+def wallet(profile: dict, balances: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[("🔄 Refresh", "m:wallet"), ("💱 Exchange", "m:exchange")]]
+    if balances:
+        rows.append([("📜 Payments", "m:payments")])
+    rows.append([("⬅️ Back", "m:main")])
+    return kb(rows)
+
+
+def exchange(balances: list[dict], step: str = "from") -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for b in balances:
+        label = f"{b['currency'].upper()} {fmt_money(b['amount'] - b['hold'], b['currency'])}"
+        row.append((label, f"x:{step}:{b['balance_id']}:{b['currency']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("⬅️ Back", "m:wallet")])
+    return kb(rows)
 
 
 def filters(s: dict) -> InlineKeyboardMarkup:

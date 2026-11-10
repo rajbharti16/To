@@ -5,7 +5,8 @@ import time
 import httpx
 
 from app.config import CACHE_TTL, HTTP_TIMEOUT, LZT_BASE, LZT_TOKEN, SEARCH_DELAY
-from app.utils.money import parse_balances, parse_user, pick_for_buy, spendable
+from app.utils.money import (parse_balances, parse_user, pick_for_buy,
+                             same_currency, spendable)
 
 
 class LztError(Exception):
@@ -24,6 +25,7 @@ class LztClient:
         self._search_lock = asyncio.Semaphore(1)
         self._last_search = 0.0
         self._cache: dict[str, tuple[float, object]] = {}
+        self._raw_balances: dict = {}
         self._http = httpx.AsyncClient(
             base_url=LZT_BASE, timeout=HTTP_TIMEOUT,
             headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
@@ -32,7 +34,6 @@ class LztClient:
     async def close(self):
         await self._http.aclose()
 
-    # ── plumbing ────────────────────────────────────────────────────────────
     def _cached(self, key: str):
         hit = self._cache.get(key)
         if hit and time.time() - hit[0] < CACHE_TTL:
@@ -89,21 +90,39 @@ class LztClient:
         return self._store("profile", parse_user(await self.me_raw()))
 
     async def balances_raw(self) -> dict:
-        return await self._req("GET", "/balance/exchange")
+        data = await self._req("GET", "/balance/exchange")
+        self._raw_balances = data if isinstance(data, dict) else {"raw": data}
+        return self._raw_balances
 
     async def balances(self) -> list[dict]:
         cached = self._cached("balances")
         if cached is not None:
             return cached
-        return self._store("balances", parse_balances(await self.balances_raw()))
+        parsed = parse_balances(await self.balances_raw())
+        return self._store("balances", parsed)
 
     async def balance_total(self, currency: str = "usd") -> float:
-        """Spendable (market, non-TG) free amount in the given currency."""
-        return spendable(await self.balances(), currency)
+        """Spendable market amount; falls back to the profile balance."""
+        total = spendable(await self.balances(), currency)
+        if total > 0:
+            return total
+        try:
+            prof = await self.profile()
+        except LztError:
+            return 0.0
+        if same_currency(prof["currency"], currency):
+            return max(0.0, prof["balance"] - prof["hold"])
+        return 0.0
 
     async def balance_for_buy(self, currency: str, price: float) -> dict | None:
-        """Balance entry that can cover `price`, or None."""
-        return pick_for_buy(await self.balances(), currency, price)
+        chosen = pick_for_buy(await self.balances(), currency, price)
+        if chosen:
+            return chosen
+        if await self.balance_total(currency) >= price:
+            return {"balance_id": 0, "currency": currency, "amount": price,
+                    "hold": 0.0, "kind": "other", "label": "Profile balance",
+                    "usable_for_buy": True}
+        return None
 
     async def currency(self) -> dict:
         cached = self._cached("currency")

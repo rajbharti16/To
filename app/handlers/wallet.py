@@ -9,8 +9,6 @@ from app.lzt import LztError
 from app.utils.texts import payment_text, wallet_text
 
 router = Router()
-
-# per-user pending exchange: {"step": "from"|"to"|"amount", "from": id, "to": id, "cur": str}
 EXCH: dict[int, dict] = {}
 
 
@@ -23,6 +21,23 @@ async def _render(cq: CallbackQuery):
 async def cmd_wallet(m: Message):
     profile, balances = await live_state()
     await m.answer(wallet_text(profile, balances), reply_markup=kb.wallet(profile, balances))
+
+
+@router.message(Command("walletdebug"))
+async def cmd_wallet_debug(m: Message):
+    try:
+        raw = await lzt.balances_raw()
+        prof = await lzt.me_raw()
+    except LztError as e:
+        return await m.answer(f"❌ {e}")
+    keys = ", ".join(sorted(raw.keys())) or "empty"
+    prof_keys = ", ".join(sorted((prof.get("user") or prof).keys()))[:400]
+    parsed = await lzt.balances()
+    body = "\n".join(f"{b['label']} | {b['currency']} | {b['amount']} | {b['kind']}"
+                     for b in parsed) or "nothing parsed"
+    await m.answer(
+        f"<b>balance keys</b>: <code>{keys}</code>\n"
+        f"<b>profile keys</b>: <code>{prof_keys}</code>\n\n<pre>{body[:1500]}</pre>")
 
 
 @router.callback_query(F.data == "m:wallet")
@@ -67,8 +82,7 @@ async def cb_exchange_step(cq: CallbackQuery):
     await show(
         cq,
         f"💱 <b>{state['cur'].upper()} → {cur.upper()}</b>\nSend amount (or pick below)",
-        kb.kb([[("10", "xa:10"), ("50", "xa:50"), ("100", "xa:100")],
-               [("⬅️ Back", "m:wallet")]]),
+        kb.kb([[("10", "xa:10"), ("50", "xa:50"), ("100", "xa:100")], [("⬅️ Back", "m:wallet")]]),
     )
     await cq.answer()
 
@@ -93,14 +107,13 @@ async def on_exchange_amount(m: Message):
 async def _do_exchange(src, amount: float):
     uid = src.from_user.id
     state = EXCH.pop(uid, None) or {}
-    tg_id = uid
     try:
         await lzt.exchange(state["from"], state["to"], amount)
     except (LztError, KeyError) as e:
-        return await src.bot.send_message(tg_id, f"❌ Exchange failed: {e}")
+        return await src.bot.send_message(uid, f"❌ Exchange failed: {e}")
 
     profile, balances = await live_state()
     await src.bot.send_message(
-        tg_id, f"✅ Exchanged {amount:g} {state['cur'].upper()}\n\n" + wallet_text(profile, balances),
+        uid, f"✅ Exchanged {amount:g} {state['cur'].upper()}\n\n" + wallet_text(profile, balances),
         reply_markup=kb.wallet(profile, balances),
     )

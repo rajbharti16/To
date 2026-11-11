@@ -35,16 +35,15 @@ def _touch(st: dict):
 
 
 def has_pending(uid: int) -> bool:
-    st = _st(uid)
-    return bool(st) and "to_id" in st
+    return bool(_st(uid)) and "to_id" in _st(uid)
 
 
-async def _snapshot_or_reply(target, edit: bool = False) -> dict | None:
+async def _snap_or_reply(target, edit: bool = False) -> dict | None:
     snap = await wallet_view.snapshot(lzt, "usd")
     if snap["error"] and not snap["entries"]:
         text = f"error <code>{html.escape(snap['error'][:200])}</code>"
         if edit:
-            await show(target, text, kb.back("m:menu"))
+            await show(target, text, kb.back("m:main"))
         else:
             await target.answer(text)
         return None
@@ -72,7 +71,7 @@ async def _deliver(bot, uid: int, amount: float, chat_id: int = 0, message_id: i
 @router.message(Command("wallet"))
 async def cmd_wallet(m: Message):
     EXCH.pop(m.from_user.id, None)
-    snap = await _snapshot_or_reply(m)
+    snap = await _snap_or_reply(m)
     if snap is None:
         return
     await m.answer(wallet_text(snap), reply_markup=kb.wallet(wallet_view.exchangable(snap)))
@@ -81,7 +80,7 @@ async def cmd_wallet(m: Message):
 @router.callback_query(F.data == "m:wallet")
 async def cb_wallet(cq: CallbackQuery):
     EXCH.pop(cq.from_user.id, None)
-    snap = await _snapshot_or_reply(cq, edit=True)
+    snap = await _snap_or_reply(cq, edit=True)
     if snap is None:
         return await cq.answer()
     await _render(cq, snap)
@@ -102,7 +101,7 @@ async def cb_payments(cq: CallbackQuery):
 
 @router.callback_query(F.data == "m:exchange")
 async def cb_exchange(cq: CallbackQuery):
-    snap = await _snapshot_or_reply(cq, edit=True)
+    snap = await _snap_or_reply(cq, edit=True)
     if snap is None:
         return await cq.answer()
     pool = wallet_view.exchangable(snap)
@@ -111,6 +110,24 @@ async def cb_exchange(cq: CallbackQuery):
         return await cq.answer()
     EXCH[cq.from_user.id] = {"ts": time.time(), "pool": pool}
     await show(cq, "<b>Exchange</b> — source balance", kb.exchange(pool, "from"))
+    await cq.answer()
+
+
+@router.callback_query(F.data.startswith("p:"))
+async def cb_page(cq: CallbackQuery):
+    parts = cq.data.split(":")
+    if len(parts) != 3:
+        return await cq.answer("bad callback", show_alert=True)
+    _, step, offset = parts
+    st = _st(cq.from_user.id)
+    if not st:
+        return await cq.answer("restart exchange", show_alert=True)
+    pool = st.get("pool") or []
+    if step == "to" and "from_id" in st:
+        pool = [b for b in pool if b["balance_id"] != st["from_id"]]
+    if not pool:
+        return await cq.answer("nothing to pick", show_alert=True)
+    await show(cq, f"<b>Exchange</b> — {step}", kb.exchange(pool, step, int(offset)))
     await cq.answer()
 
 
@@ -128,7 +145,7 @@ async def cb_step(cq: CallbackQuery):
     except ValueError:
         return await cq.answer("bad index", show_alert=True)
 
-    snap = await _snapshot_or_reply(cq, edit=True)
+    snap = await _snap_or_reply(cq, edit=True)
     if snap is None:
         return await cq.answer()
 
@@ -168,8 +185,7 @@ async def cb_step(cq: CallbackQuery):
         f"<b>{st['cur']} → {st['to_cur']}</b>\n"
         f"available: {fmt_money(avail, st['cur'])}\n\n"
         f"Send amount in <b>{st['cur']}</b>, or tap:",
-        reply_markup=kb.kb([[("10", "xa:10"), ("50", "xa:50"), ("100", "xa:100")],
-                            [("Max", "xa:max"), ("Cancel", "xc")]]))
+        reply_markup=kb.amount(st["cur"], avail))
     st["prompt"] = (msg.chat.id, msg.message_id)
     await cq.answer()
 
@@ -184,7 +200,7 @@ async def cb_amount_btn(cq: CallbackQuery):
         return await cq.answer("busy…")
 
     if raw == "max":
-        snap = await _snapshot_or_reply(cq, edit=True)
+        snap = await _snap_or_reply(cq, edit=True)
         if snap is None:
             return await cq.answer()
         src = next((b for b in snap["entries"] if b["balance_id"] == st.get("from_id")), None)
@@ -205,7 +221,7 @@ async def cb_amount_btn(cq: CallbackQuery):
 @router.callback_query(F.data == "xc")
 async def cb_exch_cancel(cq: CallbackQuery):
     EXCH.pop(cq.from_user.id, None)
-    snap = await _snapshot_or_reply(cq, edit=True)
+    snap = await _snap_or_reply(cq, edit=True)
     if snap is None:
         return await cq.answer()
     await _render(cq, snap)

@@ -74,10 +74,11 @@ async def all_owners() -> list[dict]:
 
 
 async def spent_today(tg_id: int) -> float:
-    res = await _db.purchases.aggregate([
+    cursor = await _db.purchases.aggregate([
         {"$match": {"tg_id": tg_id, "started_at": {"$gte": _now() - 86400}}},
         {"$group": {"_id": None, "s": {"$sum": "$price"}}},
-    ]).to_list(1)
+    ])
+    res = await cursor.to_list(length=1)
     return float(res[0]["s"]) if res else 0.0
 
 
@@ -164,14 +165,38 @@ async def ledger_rows(tg_id: int) -> list[dict]:
 
 
 async def ledger_stats(tg_id: int) -> dict:
-    res = await _db.ledger.aggregate([
+    cursor = await _db.ledger.aggregate([
         {"$match": {"tg_id": tg_id}},
-        {"$group": {"_id": None, "total": {"$sum": 1},
-                    "spent": {"$sum": "$buy_price"}, "revenue": {"$sum": "$sell_price"}}},
-    ]).to_list(1)
-    row = res[0] if res else {"total": 0, "spent": 0.0, "revenue": 0.0}
-    spent, revenue = float(row["spent"]), float(row["revenue"])
+        {"$group": {
+            "_id": None,
+            "total": {"$sum": 1},
+            "spent": {"$sum": "$buy_price"},
+            "revenue": {"$sum": "$sell_price"}
+        }},
+    ])
+
+    res = await cursor.to_list(length=1)
+
+    row = res[0] if res else {
+        "total": 0,
+        "spent": 0.0,
+        "revenue": 0.0
+    }
+
+    spent = float(row["spent"])
+    revenue = float(row["revenue"])
     profit = revenue - spent
-    done = await _db.ledger.count_documents({"tg_id": tg_id, "status": {"$in": ["terminated", "sold"]}})
-    return {"total": int(row["total"]), "spent": spent, "revenue": revenue,
-            "profit": profit, "roi": (profit / spent * 100) if spent else 0.0, "done": done}
+
+    done = await _db.ledger.count_documents({
+        "tg_id": tg_id,
+        "status": {"$in": ["terminated", "sold"]}
+    })
+
+    return {
+        "total": int(row["total"]),
+        "spent": spent,
+        "revenue": revenue,
+        "profit": profit,
+        "roi": (profit / spent * 100) if spent else 0.0,
+        "done": done
+    }

@@ -72,7 +72,7 @@ async def login_with_lzt(phone: str, password: str, item_id: int, lzt, proxy_cfg
 
 
 async def check_session(session_string: str, proxy_cfg: str = ""):
-    """(alive, me) — connects, verifies authorization, always disconnects."""
+    """(alive, me) — always disconnects."""
     if not session_string:
         return False, None
     c = client(session_string, proxy_cfg)

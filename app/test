@@ -1,4 +1,517 @@
 
+app/utils/texts.py
+
+
+
+"""Message formatting — $ only, no TG wallet, no prices on buttons."""
+from app.utils.filters import session_hours
+from app.utils.money import fmt_money
+
+
+def _remaining(p: dict) -> str:
+    left = p["expires_at"] - int(__import__("time").time())
+    if left <= 0:
+        return "cleaning"
+    h, m = divmod(left // 60, 60)
+    return f"{h}h {m:02d}m"
+
+
+def menu_text(s: dict, profile: dict, balance: float, queued: int) -> str:
+    return (
+        "<b>AccStore</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {profile.get('username', '?')}\n"
+        f"💳 <b>{fmt_money(balance, s['currency'])}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{'🟢 running' if s['auto_buy'] == '1' else '🔴 stopped'}"
+        f" · queue {queued}\n"
+        f"price {s['price_min']}–{s['price_max']} · spam {s['spam_mode']}\n"
+        f"target {s['session_life_hours']}h · mail {s['mail_mode']} · 2fa {s['password_mode']}\n"
+        f"include {s['countries'] or 'all'} · exclude {s['deny_countries'] or '—'}"
+    )
+
+
+def filters_text(s: dict) -> str:
+    return (
+        "<b>Filters</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"price {s['price_min']} – {s['price_max']}\n"
+        f"spam {s['spam_mode']} · mail {s['mail_mode']} · 2fa {s['password_mode']}\n"
+        f"min age {s['session_min_hours']}h · target {s['session_life_hours']}h\n"
+        f"include {s['countries'] or 'all'}\n"
+        f"exclude {s['deny_countries'] or '—'}"
+    )
+
+
+def session_line(p: dict) -> str:
+    return f"📱 {p.get('phone') or p['item_id']} · {_remaining(p)}"
+
+
+def session_detail(p: dict) -> str:
+    return (
+        f"📱 <b>{p.get('phone') or '—'}</b>\n"
+        f"item <code>{p['item_id']}</code> · {p.get('country') or '??'}\n"
+        f"bought {fmt_money(p['price'])}\n"
+        f"age at buy {p.get('age_at_buy_hours', 0):.2f}h → target {p.get('target_age_hours', 24):g}h\n"
+        f"⏳ {_remaining(p)}\n"
+        f"📧 {p.get('mail') or '—'}"
+    )
+
+
+def session_file(p: dict) -> str:
+    return (
+        f"# AccStore session\n"
+        f"phone = {p.get('phone')}\n"
+        f"item_id = {p['item_id']}\n"
+        f"mail = {p.get('mail') or ''}\n"
+        f"age_at_buy_hours = {p.get('age_at_buy_hours', 0)}\n\n"
+        f"from telethon.sync import TelegramClient\n"
+        f"from telethon.sessions import StringSession\n\n"
+        f"session = StringSession(\n    \"{p.get('session_string') or ''}\"\n)\n"
+        f"client = TelegramClient(session, API_ID, API_HASH)\n"
+        f"client.start()\n"
+        f"print(client.get_me())\n"
+    )
+
+
+def stats_text(st: dict) -> str:
+    return (
+        "<b>Stats</b>\n"
+        f"trades {st['total']}\n"
+        f"spent {fmt_money(st['spent'])}\n"
+        f"revenue {fmt_money(st['revenue'])}\n"
+        f"net {fmt_money(st['profit'])} ({st['roi']:.1f}% roi)"
+    )
+
+
+def payment_text(p: dict) -> str:
+    sign = "+" if (p.get("operation_type") or "") in ("income", "incoming") else "−"
+    return (f"{sign} {fmt_money(abs(float(p.get('amount') or 0)), p.get('currency') or 'usd')}"
+            f" · {p.get('operation_type') or 'op'} · {(p.get('comment') or '')[:30]}")
+
+
+app/utils/money.py
+
+
+"""Balance/profile parsing that survives unknown payload shapes."""
+from decimal import Decimal, InvalidOperation
+
+SYMBOLS = {"usd": "$", "eur": "€", "rub": "₽", "uah": "₴", "gbp": "£",
+           "kzt": "₸", "byn": "Br", "cny": "¥", "try": "₺", "jpy": "¥", "brl": "R$"}
+
+ALIASES = {"usdt": "usd", "usdc": "usd", "busd": "usd", "usdtt": "usd",
+           "rubr": "rub", "eurc": "eur"}
+
+TELEGRAM_MARKERS = ("telegram", "tg", "wallet")
+MARKET_MARKERS = ("market", "main", "trade", "spend")
+
+CUR_KEYS = ("currency", "cur", "code", "currency_code")
+AMT_KEYS = ("balance", "amount", "value", "sum", "available", "free")
+HOLD_KEYS = ("hold", "held", "frozen", "pending", "locked")
+ID_KEYS = ("balance_id", "id", "wallet_id", "balanceid")
+
+
+def canon(currency: str) -> str:
+    c = (currency or "usd").strip().lower()
+    return ALIASES.get(c, c)
+
+
+def same_currency(a: str, b: str) -> bool:
+    return canon(a) == canon(b)
+
+
+def _num(v, default=None):
+    try:
+        return float(Decimal(str(v)))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def fmt_money(amount: float, currency: str = "usd") -> str:
+    cur = (currency or "usd").lower()
+    if cur in SYMBOLS:
+        return f"{SYMBOLS[cur]}{amount:,.2f}"
+    return f"{amount:,.2f} {cur.upper()}"
+
+
+def parse_user(payload: dict) -> dict:
+    u = (payload or {}).get("user") or payload or {}
+    return {
+        "user_id": u.get("user_id") or u.get("id") or 0,
+        "username": u.get("username") or "?",
+        "currency": canon(u.get("currency")),
+        "balance": _num(u.get("balance"), 0.0),
+        "hold": _num(u.get("hold"), 0.0),
+        "sympathies": _num(u.get("sympathies"), 0.0),
+        "like_count": _num(u.get("like_count"), 0.0),
+        "items_count": _num(u.get("items_count"), 0.0),
+    }
+
+
+def _is_currency(v) -> bool:
+    return isinstance(v, str) and 2 <= len(v) <= 5 and v.replace("_", "").isalpha()
+
+
+def _pick(d: dict, keys) -> tuple[str | None, object]:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return k, d[k]
+    return None, None
+
+
+def _kind(d: dict) -> str:
+    raw = " ".join(str(v).lower() for v in d.values() if isinstance(v, (str, int, float)))
+    if any(m in raw for m in TELEGRAM_MARKERS):
+        return "telegram"
+    if any(m in raw for m in MARKET_MARKERS):
+        return "market"
+    return "other"
+
+
+def _label(d: dict) -> str:
+    for k in ("title", "name", "label", "type", "balance_type", "slug", "description"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip() and not _is_currency(v):
+            return v.strip()[:24]
+    return ""
+
+
+def _entry(d: dict, currency: str) -> dict:
+    kind = _kind(d)
+    _, hold = _pick(d, HOLD_KEYS)
+    _, bid = _pick(d, ID_KEYS)
+    return {
+        "balance_id": int(_num(bid, 0) or 0),
+        "currency": currency.lower(),
+        "amount": _num(_pick(d, AMT_KEYS)[1], 0.0),
+        "hold": _num(hold, 0.0),
+        "kind": kind,
+        "label": _label(d) or {"market": "Market balance", "telegram": "TG wallet"}.get(kind, "Balance"),
+        "usable_for_buy": kind != "telegram",
+    }
+
+
+def _walk(node, out: list, depth: int = 0):
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        _, cur = _pick(node, CUR_KEYS)
+        if _is_currency(cur) and _pick(node, AMT_KEYS)[1] is not None:
+            out.append(_entry(node, cur))
+            return
+        for v in node.values():
+            _walk(v, out, depth + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _walk(v, out, depth + 1)
+
+
+def parse_balances(payload: dict) -> list[dict]:
+    """Find every {currency, amount} object anywhere in the payload, deduped."""
+    out: list[dict] = []
+    _walk(payload or {}, out)
+
+    seen, unique = set(), []
+    for b in out:
+        key = (b["balance_id"], b["currency"], round(b["amount"], 6), b["kind"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(b)
+
+    if not unique:
+        user = (payload or {}).get("user") or {}
+        if _is_currency(user.get("currency")) and user.get("balance") is not None:
+            unique = [_entry(user, user["currency"])]
+    return unique
+
+
+def _rank(b: dict) -> tuple:
+    order = {"market": 0, "other": 1, "telegram": 2}
+    return (order.get(b["kind"], 1), -(b["amount"] - b["hold"]))
+
+
+def spendable(balances: list[dict], currency: str) -> float:
+    return sum(max(0.0, b["amount"] - b["hold"])
+               for b in balances
+               if b["usable_for_buy"] and same_currency(b["currency"], currency))
+
+
+def total_any(balances: list[dict], currency: str) -> float:
+    return sum(max(0.0, b["amount"] - b["hold"])
+               for b in balances if same_currency(b["currency"], currency))
+
+
+def pick_for_buy(balances: list[dict], currency: str, price: float) -> dict | None:
+    """Best balance covering `price`. Market first, telegram never."""
+    cands = [b for b in sorted(balances, key=_rank)
+             if b["usable_for_buy"] and same_currency(b["currency"], currency)
+             and (b["amount"] - b["hold"]) >= price]
+    return cands[0] if cands else None
+
+
+ app/utils/filters.py
+
+
+
+"""Pure filter logic — no IO, unit-testable.
+
+Two phases:
+  passes(item, s)                      -> pre-check, search result fields only
+  passes(item, s, authoritative=True)  -> post-check, full check-account payload
+
+The search endpoint returns a reduced item: no telegram_spam_block, no
+telegram_password, no country, no session age. Anything missing is treated as
+"unknown" and never rejects — the server-side query already filtered it.
+"""
+from __future__ import annotations
+
+import re
+
+TARGET_FALLBACK = 24.0
+
+_FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
+_COUNTRY_RE = re.compile(r"\(([A-Z]{2})\)")
+_PHONE_RE = re.compile(r"\+\d{6,16}")
+
+_AGE_NUM_KEYS = (
+    "telegram_session_age",
+    "session_age",
+    "session_age_hours",
+    "session_age_seconds",
+)
+_PERIOD_KEYS = ("session_age_period", "telegram_session_age_period")
+
+_PERIOD_HOURS = {
+    "hour": 1.0, "hours": 1.0, "h": 1.0, "hr": 1.0, "hrs": 1.0,
+    "час": 1.0, "часа": 1.0, "часов": 1.0, "ч": 1.0,
+    "day": 24.0, "days": 24.0, "d": 24.0,
+    "д": 24.0, "дн": 24.0, "дня": 24.0, "дней": 24.0, "сут": 24.0, "суток": 24.0,
+    "month": 730.0, "months": 730.0, "mo": 730.0,
+    "мес": 730.0, "месяц": 730.0, "месяца": 730.0, "месяцев": 730.0,
+    "year": 8760.0, "years": 8760.0, "y": 8760.0,
+    "г": 8760.0, "год": 8760.0, "года": 8760.0, "лет": 8760.0,
+}
+
+_AGE_TEXT_RES = (
+    re.compile(
+        r"(?:session\s*age|возраст\s*сесси[ия]|сесси[яи])\s*[:\-–—]?\s*"
+        r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?"
+    ),
+    re.compile(
+        r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?\s*(?:session|сесси[яи])"
+    ),
+)
+
+
+def _num(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_bool(value) -> bool | None:
+    """Tri-state: True / False / None (unknown)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in ("1", "true", "yes", "y", "on"):
+            return True
+        if t in ("0", "false", "no", "n", "off", ""):
+            return False
+    return None
+
+
+def _flag_to_iso(match) -> str:
+    return "".join(chr(ord(ch) - 0x1F1E6 + 65) for ch in match.group(0))
+
+
+def country_of(item: dict) -> str:
+    """ISO2 country: explicit fields, then flag emoji, then the "(XX)" marker."""
+    for key in ("country", "country_code", "telegram_country"):
+        explicit = str(item.get(key) or "").strip().upper()
+        if len(explicit) == 2 and explicit.isalpha():
+            return explicit
+    text = f"{item.get('title') or ''} {item.get('description') or ''}"
+    flag = _FLAG_RE.search(text)
+    if flag:
+        return _flag_to_iso(flag)
+    m = _COUNTRY_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def phone_of(item: dict) -> str:
+    m = _PHONE_RE.search(item.get("title", "") or "")
+    return m.group(0) if m else ""
+
+
+def _period_hours(item: dict) -> float | None:
+    for key in _PERIOD_KEYS:
+        raw = item.get(key)
+        if isinstance(raw, str):
+            mult = _PERIOD_HOURS.get(raw.strip().lower())
+            if mult:
+                return mult
+    return None
+
+
+def _unit_from_key(key: str) -> float | None:
+    if key.endswith("_seconds"):
+        return 1 / 3600
+    if key.endswith("_hours"):
+        return 1.0
+    if key.endswith("_days"):
+        return 24.0
+    return None
+
+
+def _age_from_text(item: dict) -> float | None:
+    text = f"{item.get('title') or ''} {item.get('description') or ''}"
+    if not text.strip():
+        return None
+    for rx in _AGE_TEXT_RES:
+        for m in rx.finditer(text):
+            amount = _num(m.group(1))
+            if amount is None or amount <= 0:
+                continue
+            unit = (m.group(2) or "").strip().lower()
+            mult = _PERIOD_HOURS.get(unit)
+            if mult:
+                return amount * mult
+            if unit in ("", "s"):
+                return amount * 24.0
+    return None
+
+
+def session_hours(item: dict) -> float | None:
+    """Age of the session in hours, or None when it cannot be determined."""
+    for key in _AGE_NUM_KEYS:
+        raw = item.get(key)
+        v = _num(raw)
+        if v is None or v <= 0:
+            continue
+        mult = _period_hours(item) or _unit_from_key(key)
+        if mult:
+            return v * mult
+        if v > 100_000:
+            return v / 3600
+        if v > 1_000:
+            return v
+        return v * 24.0
+    return _age_from_text(item)
+
+
+def search_query(s: dict) -> dict:
+    """Server-side age floor. Empty dict when no floor is configured."""
+    floor = _num(s.get("session_min_hours")) or 0.0
+    days = int(floor // 24)
+    if days < 1:
+        return {}
+    if days % 30 == 0:
+        return {"session_age": days // 30, "session_age_period": "month"}
+    return {"session_age": days, "session_age_period": "day"}
+
+
+def spam_state(item: dict) -> bool | None:
+    return _as_bool(item.get("telegram_spam_block"))
+
+
+def mail_state(item: dict) -> bool | None:
+    flag = _as_bool(item.get("telegram_email"))
+    if flag is not None:
+        return flag
+    et = item.get("email_type")
+    if et is None:
+        return None
+    return str(et).strip().lower() not in ("", "no")
+
+
+def pass_state(item: dict) -> bool | None:
+    pw = item.get("telegram_password")
+    if pw is None:
+        return None
+    return bool(str(pw).strip())
+
+
+def _codes(raw: str) -> set[str]:
+    return {c.strip().upper() for c in (raw or "").split(",") if c.strip()}
+
+
+def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]:
+    """Returns (ok, reason). Unknown fields never reject."""
+    price = _num(item.get("price")) or 0.0
+    if price < (_num(s.get("price_min")) or 0.0):
+        return False, "price_min"
+    if price > (_num(s.get("price_max")) or float("inf")):
+        return False, "price_max"
+
+    nsb = _as_bool(item.get("nsb"))
+    if s.get("nsb_only") == "1" and nsb is False:
+        return False, "resold"
+
+    if not authoritative:
+        return True, "ok"
+
+    unknown = False
+
+    spam = spam_state(item)
+    mode = s.get("spam_mode", "no")
+    if spam is None:
+        unknown = True
+    elif mode == "yes" and spam is False:
+        return False, "spam"
+    elif mode == "no" and spam is True:
+        return False, "spam"
+
+    mail = mail_state(item)
+    mode = s.get("mail_mode", "any")
+    if mail is None:
+        unknown = True
+    elif mode == "yes" and mail is False:
+        return False, "no_mail"
+    elif mode == "no" and mail is True:
+        return False, "has_mail"
+
+    has_pw = pass_state(item)
+    mode = s.get("password_mode", "any")
+    if has_pw is None:
+        unknown = True
+    elif mode == "yes" and has_pw is False:
+        return False, "no_2fa"
+    elif mode == "no" and has_pw is True:
+        return False, "has_2fa"
+
+    cc = country_of(item)
+    if cc:
+        if cc in _codes(s.get("deny_countries", "")):
+            return False, "country_excluded"
+        allow = _codes(s.get("countries", ""))
+        if allow and cc not in allow:
+            return False, "country_not_included"
+    else:
+        unknown = True
+
+    floor = _num(s.get("session_min_hours")) or 0.0
+    if floor:
+        age = session_hours(item)
+        if age is None:
+            unknown = True
+        elif age < floor:
+            return False, "session_too_fresh"
+
+    return True, ("ok_unknown" if unknown else "ok")
+
+
+def clean_delay_hours(item: dict, target: float = TARGET_FALLBACK) -> float:
+    """Hours to wait before cleaning. 0.0 means clean immediately."""
+    age = session_hours(item) or 0.0
+    return max(0.0, float(target) - age)
+
 
 app/config.py
 

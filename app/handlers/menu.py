@@ -5,8 +5,7 @@ from aiogram.types import CallbackQuery, Message
 from app import db, keyboards as kb
 from app.config import OWNER_IDS
 from app.deps import lzt
-from app.lzt import LztError
-from app.utils.money import spendable
+from app.utils import wallet as wallet_view
 from app.utils.texts import menu_text
 
 router = Router()
@@ -32,14 +31,19 @@ async def show(cq: CallbackQuery, text: str, markup):
 
 async def render_menu(tg_id: int) -> tuple[str, object]:
     s = await db.get_settings(tg_id)
+    snap = await wallet_view.snapshot(lzt, s["currency"])
     try:
         profile = await lzt.profile()
-        balances = await lzt.balances()
-        balance = spendable(balances, s["currency"])
-    except LztError:
-        profile, balance = {"username": "offline"}, 0.0
+    except Exception:
+        profile = {"username": "offline"}
+
+    note = snap["note"]
+    if not snap["error"] and snap["spendable"] < db.num(s.get("price_min")):
+        hint = f"below min price {s['price_min']}"
+        note = f"{note} · {hint}" if note else hint
+
     queued = await db.queue_count(tg_id)
-    return menu_text(s, profile, balance, queued), kb.main(s)
+    return menu_text(s, profile, snap["total"], snap["spendable"], queued, note), kb.main(s)
 
 
 @router.message(Command("start"))

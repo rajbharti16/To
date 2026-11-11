@@ -9,6 +9,7 @@ from app import db, engine
 from app.config import OWNER_IDS
 from app.deps import lzt
 from app.utils import wallet as wallet_view
+from app.utils.filters import mail_state, pass_state, spam_state
 from app.utils.money import fmt_money
 
 router = Router()
@@ -94,7 +95,7 @@ async def cmd_diag(m: Message):
 
 @router.message(Command("peek"))
 async def cmd_peek(m: Message):
-    """Dump real check-account fields — no more guessing field names."""
+    """Dump real check-account fields and how the filters read them."""
     if not _owner(m):
         return
     parts = (m.text or "").split()
@@ -109,6 +110,10 @@ async def cmd_peek(m: Message):
             "telegram_password", "country", "created_at", "registration_date",
             "telegram_session_age", "session_age", "session_age_period", "nsb")
     lines = [f"{k} = {item.get(k)!r}" for k in keep if k in item]
+    lines.append("—")
+    lines.append(f"spam_state = {spam_state(item)!r}")
+    lines.append(f"email_state = {mail_state(item)!r}")
+    lines.append(f"pass_state = {pass_state(item)!r}")
     lines.append("—")
     lines.append("keys: " + ", ".join(sorted(item)[:60]))
     await m.answer(f"<code>{html.escape(chr(10).join(lines))}</code>")

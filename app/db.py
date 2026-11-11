@@ -143,7 +143,6 @@ def normalize_setting(key: str, value) -> str | None:
 
 
 def normalize_settings(raw: dict) -> tuple[dict, dict]:
-    """(clean, fixes). fixes holds only keys that had to be repaired."""
     clean, fixes = {}, {}
     for key, default in DEFAULTS.items():
         norm = NORMALIZERS[key](raw.get(key, default))
@@ -178,7 +177,8 @@ async def close_db():
 
 async def ensure_user(tg_id: int, username: str = ""):
     await _db.users.update_one(
-        {"_id": tg_id}, {"$setOnInsert": {"username": username, "created_at": _now()}}, upsert=True)
+        {"_id": tg_id}, {"$setOnInsert": {"username": username, "created_at": _now()}},
+        upsert=True)
     clean, _ = normalize_settings({})
     await _db.settings.update_one(
         {"tg_id": tg_id}, {"$setOnInsert": {**clean, "tg_id": tg_id}}, upsert=True)
@@ -199,13 +199,11 @@ async def get_settings(tg_id: int) -> dict:
 
 
 async def set_setting(tg_id: int, key: str, value) -> str | None:
-    """Stores the normalized value. Returns it, or None for an unknown key."""
     norm = normalize_setting(key, value)
     if norm is None:
         return None
     await _db.settings.update_one(
-        {"tg_id": tg_id},
-        {"$set": {key: norm}, "$setOnInsert": {"tg_id": tg_id}},
+        {"tg_id": tg_id}, {"$set": {key: norm}, "$setOnInsert": {"tg_id": tg_id}},
         upsert=True)
     return norm
 
@@ -287,10 +285,10 @@ async def bump_expiry(pid, seconds: int, inc_tries: bool = False):
     oid = _oid(pid)
     if not oid:
         return
-    upd = {"$inc": {"expires_at": int(seconds)}}
+    inc = {"expires_at": int(seconds)}
     if inc_tries:
-        upd["$inc"]["expiry_tries"] = 1
-    await _db.purchases.update_one({"_id": oid}, upd)
+        inc["expiry_tries"] = 1
+    await _db.purchases.update_one({"_id": oid}, {"$inc": inc})
 
 
 async def close_purchase(pid, status: str, note: str = "", new_mail: str = ""):
@@ -309,8 +307,7 @@ async def mark_sold(pid, sell_price: float) -> bool:
     oid = _oid(pid)
     if not oid:
         return False
-    hit = await _db.purchases.find_one({"_id": oid}, {"_id": 1})
-    if not hit:
+    if not await _db.purchases.find_one({"_id": oid}, {"_id": 1}):
         return False
     now = _now()
     await _db.ledger.update_one(
@@ -328,30 +325,18 @@ async def ledger_rows(tg_id: int) -> list[dict]:
 async def ledger_stats(tg_id: int) -> dict:
     cursor = await _db.ledger.aggregate([
         {"$match": {"tg_id": tg_id}},
-        {"$group": {
-            "_id": None,
-            "total": {"$sum": 1},
-            "spent": {"$sum": "$buy_price"},
-            "revenue": {"$sum": "$sell_price"},
-        }},
+        {"$group": {"_id": None, "total": {"$sum": 1},
+                    "spent": {"$sum": "$buy_price"},
+                    "revenue": {"$sum": "$sell_price"}}},
     ])
     res = await cursor.to_list(length=1)
     row = res[0] if res else {"total": 0, "spent": 0.0, "revenue": 0.0}
-
-    spent = float(row["spent"])
-    revenue = float(row["revenue"])
+    spent, revenue = float(row["spent"]), float(row["revenue"])
     profit = revenue - spent
     done = await _db.ledger.count_documents(
         {"tg_id": tg_id, "status": {"$in": ["terminated", "sold"]}})
-
-    return {
-        "total": int(row["total"]),
-        "spent": spent,
-        "revenue": revenue,
-        "profit": profit,
-        "roi": (profit / spent * 100) if spent else 0.0,
-        "done": done,
-    }
+    return {"total": int(row["total"]), "spent": spent, "revenue": revenue,
+            "profit": profit, "roi": (profit / spent * 100) if spent else 0.0, "done": done}
 
 
 async def save_report(tg_id: int, *, scanned: int = 0, bought: int = 0,

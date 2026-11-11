@@ -5,19 +5,20 @@ import time
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from pymongo import ASCENDING, AsyncMongoClient
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
 
-from app.config import MONGO_DB, MONGO_URI
+from app.config import MONGO_DB, MONGO_URI, REPORT_KEEP_HOURS
 
 log = logging.getLogger("db")
 
 DEFAULTS = {
     "price_min": "0.05", "price_max": "1.00",
     "spam_mode": "no", "mail_mode": "yes", "mail_type": "any", "password_mode": "no",
-    "session_min_hours": "0", "session_life_hours": "24",
+    "session_min_hours": "0", "session_max_hours": "0", "session_life_hours": "24",
     "countries": "", "deny_countries": "IR,RU",
     "nsb_only": "1", "max_buy_per_cycle": "2", "daily_spend_cap": "15",
     "poll_interval": "25", "auto_buy": "0",
+    "early_clean_if_aged": "1",
     "terminate_on_expire": "1", "change_mail_on_expire": "1",
     "verify_spam": "1", "currency": "usd", "proxy": "", "mail_provider": "auto",
 }
@@ -116,15 +117,17 @@ NORMALIZERS = {
     "mail_mode": _enum(("yes", "no", "any"), "yes"),
     "mail_type": _enum(("any", "native", "temp"), "any"),
     "password_mode": _enum(("yes", "no", "any"), "no"),
-    "session_min_hours": _f("0", 0.0, 87600.0),
-    "session_life_hours": _f("24", 0.0, 87600.0),
+    "session_min_hours": _f("0", 0.0, 87_600.0),
+    "session_max_hours": _f("0", 0.0, 87_600.0),
+    "session_life_hours": _f("24", 0.0, 87_600.0),
     "countries": _codes,
     "deny_countries": _codes,
     "nsb_only": _flag("1"),
     "max_buy_per_cycle": _i("2", 1, 100),
     "daily_spend_cap": _f("15", 0.0),
-    "poll_interval": _i("25", 5, 3600),
+    "poll_interval": _i("25", 5, 3_600),
     "auto_buy": _flag("0"),
+    "early_clean_if_aged": _flag("1"),
     "terminate_on_expire": _flag("1"),
     "change_mail_on_expire": _flag("1"),
     "verify_spam": _flag("1"),
@@ -150,6 +153,10 @@ def normalize_settings(raw: dict) -> tuple[dict, dict]:
     if num(clean["price_max"]) < num(clean["price_min"]):
         clean["price_max"] = clean["price_min"]
         fixes["price_max"] = clean["price_max"]
+    cap = num(clean["session_max_hours"])
+    if cap and num(clean["session_min_hours"]) > cap:
+        clean["session_max_hours"] = clean["session_min_hours"]
+        fixes["session_max_hours"] = clean["session_max_hours"]
     return clean, fixes
 
 
@@ -161,6 +168,7 @@ async def init_db():
     await _db.purchases.create_index([("tg_id", ASCENDING)])
     await _db.ledger.create_index([("tg_id", ASCENDING), ("created_at", ASCENDING)])
     await _db.settings.create_index([("tg_id", ASCENDING)], unique=True)
+    await _db.reports.create_index([("tg_id", ASCENDING), ("ts", DESCENDING)])
 
 
 async def close_db():
@@ -208,7 +216,7 @@ async def all_owners() -> list[dict]:
 
 async def spent_today(tg_id: int) -> float:
     cursor = await _db.purchases.aggregate([
-        {"$match": {"tg_id": tg_id, "started_at": {"$gte": _now() - 86400}}},
+        {"$match": {"tg_id": tg_id, "started_at": {"$gte": _now() - 86_400}}},
         {"$group": {"_id": None, "s": {"$sum": "$price"}}},
     ])
     res = await cursor.to_list(length=1)
@@ -217,14 +225,18 @@ async def spent_today(tg_id: int) -> float:
 
 async def add_purchase(tg_id, item_id, phone, country, price, mail="", mail_password="",
                        session_string="", expires_at=0, target_age_hours=24.0,
-                       age_at_buy_hours=0.0, status="active", note="") -> str:
+                       age_at_buy_hours=0.0, account_created_ts=0, status="active",
+                       note="") -> str:
     now = _now()
     pid = (await _db.purchases.insert_one({
         "tg_id": tg_id, "item_id": item_id, "phone": phone, "country": country,
         "price": float(price), "mail": mail, "mail_password": mail_password,
         "session_string": session_string, "status": status,
         "started_at": now, "expires_at": int(expires_at),
-        "target_age_hours": float(target_age_hours), "age_at_buy_hours": float(age_at_buy_hours),
+        "target_age_hours": float(target_age_hours),
+        "age_at_buy_hours": float(age_at_buy_hours),
+        "account_created_ts": int(account_created_ts or 0),
+        "expiry_tries": 0, "session_state": "pending", "checked_at": 0,
         "closed_at": 0, "note": note,
     })).inserted_id
     await _db.ledger.insert_one({
@@ -261,23 +273,31 @@ async def find_by_phone(tg_id: int, needle: str) -> dict | None:
         {"tg_id": tg_id, "phone": {"$regex": pattern}}, sort=[("_id", -1)])
 
 
+async def set_purchase(pid, **fields):
+    oid = _oid(pid)
+    if oid and fields:
+        await _db.purchases.update_one({"_id": oid}, {"$set": fields})
+
+
 async def set_session(pid, session_string: str):
-    oid = _oid(pid)
-    if oid:
-        await _db.purchases.update_one({"_id": oid}, {"$set": {"session_string": session_string}})
+    await set_purchase(pid, session_string=session_string, session_state="live")
 
 
-async def bump_expiry(pid, seconds: int):
+async def bump_expiry(pid, seconds: int, inc_tries: bool = False):
     oid = _oid(pid)
-    if oid:
-        await _db.purchases.update_one({"_id": oid}, {"$inc": {"expires_at": int(seconds)}})
+    if not oid:
+        return
+    upd = {"$inc": {"expires_at": int(seconds)}}
+    if inc_tries:
+        upd["$inc"]["expiry_tries"] = 1
+    await _db.purchases.update_one({"_id": oid}, upd)
 
 
 async def close_purchase(pid, status: str, note: str = "", new_mail: str = ""):
     oid = _oid(pid)
     if not oid:
         return
-    upd = {"status": status, "closed_at": _now(), "note": note}
+    upd = {"status": status, "closed_at": _now(), "note": note, "expires_at": 0}
     if new_mail:
         upd["mail"] = new_mail
     await _db.purchases.update_one({"_id": oid}, {"$set": upd})
@@ -285,14 +305,20 @@ async def close_purchase(pid, status: str, note: str = "", new_mail: str = ""):
         {"purchase_id": oid}, {"$set": {"status": status, "closed_at": _now(), "extra": note}})
 
 
-async def mark_sold(pid, sell_price: float):
+async def mark_sold(pid, sell_price: float) -> bool:
     oid = _oid(pid)
     if not oid:
-        return
+        return False
+    hit = await _db.purchases.find_one({"_id": oid}, {"_id": 1})
+    if not hit:
+        return False
+    now = _now()
     await _db.ledger.update_one(
         {"purchase_id": oid},
-        {"$set": {"sell_price": float(sell_price), "status": "sold", "closed_at": _now()}})
-    await _db.purchases.update_one({"_id": oid}, {"$set": {"status": "sold"}})
+        {"$set": {"sell_price": float(sell_price), "status": "sold", "closed_at": now}})
+    await _db.purchases.update_one(
+        {"_id": oid}, {"$set": {"status": "sold", "closed_at": now, "expires_at": 0}})
+    return True
 
 
 async def ledger_rows(tg_id: int) -> list[dict]:
@@ -326,3 +352,18 @@ async def ledger_stats(tg_id: int) -> dict:
         "roi": (profit / spent * 100) if spent else 0.0,
         "done": done,
     }
+
+
+async def save_report(tg_id: int, *, scanned: int = 0, bought: int = 0,
+                      reasons: dict | None = None, note: str = "", error: str = ""):
+    now = _now()
+    await _db.reports.insert_one({
+        "tg_id": tg_id, "ts": now, "scanned": int(scanned), "bought": int(bought),
+        "skipped": int(sum((reasons or {}).values())), "reasons": reasons or {},
+        "note": note[:200], "error": error[:300],
+    })
+    await _db.reports.delete_many({"tg_id": tg_id, "ts": {"$lt": now - REPORT_KEEP_HOURS * 3600}})
+
+
+async def recent_reports(tg_id: int, limit: int = 10) -> list[dict]:
+    return await _db.reports.find({"tg_id": tg_id}).sort("ts", DESCENDING).limit(limit).to_list(None)

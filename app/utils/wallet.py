@@ -1,9 +1,4 @@
-"""Balance snapshot: authoritative market total + spendable entries.
-
-`balances()` alone is not enough — the real money lives on the user object, and
-the per-balance list can be empty or hold only the TG wallet. The total is read
-independently and the list only refines it, never shrinks it.
-"""
+"""Balance snapshot: authoritative market total + spendable entries."""
 import logging
 
 from app.utils.money import free_of, same_currency, spendable, total_of
@@ -42,7 +37,6 @@ async def snapshot(lzt, currency: str) -> dict:
               if b["usable_for_buy"] and same_currency(b["currency"], currency)]
     total = max(total, sum(free_of(b) for b in usable))
 
-    # money exists but nothing is chargeable → fall back to the default balance
     if total > 0 and not any(free_of(b) >= total for b in usable):
         if not usable:
             entries.append({
@@ -56,7 +50,7 @@ async def snapshot(lzt, currency: str) -> dict:
         snap["note"] = f"balances in {', '.join(sorted(others))}, settings say {currency}"
 
     snap["entries"] = entries
-    snap["spendable"] = spendable(entries, currency)   # after the fallback
+    snap["spendable"] = spendable(entries, currency)
     snap["total"] = max(total, snap["spendable"])
     return snap
 

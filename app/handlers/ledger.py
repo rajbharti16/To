@@ -17,14 +17,8 @@ async def cmd_report(m: Message):
     await m.answer(report_text(await db.recent_reports(m.from_user.id)), reply_markup=kb.report())
 
 
-@router.callback_query(F.data == "r:view")
+@router.callback_query(F.data.in_({"m:report", "r:view"}))
 async def cb_report(cq: CallbackQuery):
-    await show(cq, report_text(await db.recent_reports(cq.from_user.id)), kb.report())
-    await cq.answer()
-
-
-@router.callback_query(F.data == "m:report")
-async def cb_report_open(cq: CallbackQuery):
     await show(cq, report_text(await db.recent_reports(cq.from_user.id)), kb.report())
     await cq.answer()
 
@@ -38,10 +32,9 @@ async def cb_stats(cq: CallbackQuery):
 @router.callback_query(F.data == "m:ledger")
 async def cb_ledger(cq: CallbackQuery):
     st = await db.ledger_stats(cq.from_user.id)
-    text = (f"<b>Ledger</b>\nrows {st['total']} · closed {st['done']}\n"
-            f"spent {st['spent']:.2f} · revenue {st['revenue']:.2f}\n\n"
-            f"<i>export for the full CSV</i>")
-    await show(cq, text, kb.kb([[("Export CSV", "l:csv")], [("Back", "m:main")]]))
+    await show(cq, f"<b>Ledger</b>\nrows {st['total']} · closed {st['done']}\n"
+                   f"spent {st['spent']:.2f} · revenue {st['revenue']:.2f}\n\n"
+                   f"<i>export for the full CSV</i>", kb.ledger())
     await cq.answer()
 
 

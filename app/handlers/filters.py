@@ -107,8 +107,8 @@ async def cb_input(cq: CallbackQuery):
     key = cq.data.split(":", 1)[1]
     if key in COUNTRY_KEYS:
         hint = COUNTRY_KEYS[key]
-        body = (f"Send ISO codes, comma separated (e.g. <code>AE,LY,JO</code>)\n"
-                f"<code>all</code> = clear · /cancel")
+        body = ("Send ISO codes, comma separated (e.g. <code>AE,LY,JO</code>)\n"
+                "<code>all</code> = clear · /cancel")
     elif key in NUMERIC:
         label, hint, lo, hi, _ = NUMERIC[key]
         body = f"Send a number ({lo:g}-{hi:g}) · /cancel"
@@ -141,6 +141,10 @@ async def on_text(m: Message):
         return  # keep the pending value alive across commands
     key = _pop_pending(m.from_user.id)
     if not key:
+        # amount entry for an active exchange — keeps router order irrelevant
+        from app.handlers import wallet
+        if wallet.has_pending(m.from_user.id):
+            return await wallet.on_amount(m)
         return
 
     raw = m.text.strip().replace(" ", "").replace(",", ".")

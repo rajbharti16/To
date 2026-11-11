@@ -1,4 +1,5 @@
 import asyncio
+import html
 
 from aiogram import Router
 from aiogram.filters import Command
@@ -44,7 +45,6 @@ async def cmd_sold(m: Message):
 
 @router.message(Command("buy"))
 async def cmd_buy(m: Message):
-    """Force one cycle right now."""
     if not _owner(m):
         return
     await db.set_setting(m.from_user.id, "auto_buy", "1")
@@ -65,8 +65,7 @@ async def _run_once(bot, tg_id: int):
         bits.append(f"scan {row['scanned']} · buy {row.get('bought', 0)}")
     reasons = row.get("reasons") or {}
     if reasons:
-        top = ", ".join(f"{k}×{v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])[:4])
-        bits.append(top)
+        bits.append(", ".join(f"{k}×{v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])[:4]))
     try:
         await bot.send_message(tg_id, "cycle: " + (" · ".join(bits) or "no data"))
     except Exception:
@@ -75,7 +74,6 @@ async def _run_once(bot, tg_id: int):
 
 @router.message(Command("diag"))
 async def cmd_diag(m: Message):
-    """Show exactly what the buyer sees, so a blocked cycle is obvious."""
     if not _owner(m):
         return
     s = await db.get_settings(m.from_user.id)
@@ -92,3 +90,25 @@ async def cmd_diag(m: Message):
         f"note {snap['note'] or '—'}\n"
         f"error {snap['error'] or '—'}"
     )
+
+
+@router.message(Command("peek"))
+async def cmd_peek(m: Message):
+    """Dump real check-account fields — no more guessing field names."""
+    if not _owner(m):
+        return
+    parts = (m.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await m.answer("usage: /peek <item_id>")
+    try:
+        chk = await lzt.check_account(int(parts[1]))
+    except Exception as e:
+        return await m.answer(f"error {e}")
+    item = chk.get("item") or {}
+    keep = ("price", "telegram_spam_block", "spam_block", "telegram_email", "email_type",
+            "telegram_password", "country", "created_at", "registration_date",
+            "telegram_session_age", "session_age", "session_age_period", "nsb")
+    lines = [f"{k} = {item.get(k)!r}" for k in keep if k in item]
+    lines.append("—")
+    lines.append("keys: " + ", ".join(sorted(item)[:60]))
+    await m.answer(f"<code>{html.escape(chr(10).join(lines))}</code>")

@@ -9,11 +9,12 @@ from app.config import EXPIRY_LOGIN_GRACE, EXPIRY_RETRY, EXPIRY_RETRY_DELAY, TIC
 from app.lzt import LztError
 from app.mail_engine import IMAPMailClient, TempMailClient
 from app.session_manager import change_email, check_session, client, login_with_lzt, terminate
+from app.utils import wallet as wallet_view
 from app.utils.filters import (
     account_created_ts, age_hours_of, clean_delay_hours, country_of, passes, phone_of,
     search_query,
 )
-from app.utils.money import fmt_money, free_of, pick_for_buy, spendable
+from app.utils.money import fmt_money, free_of, pick_for_buy
 
 log = logging.getLogger("engine")
 
@@ -66,14 +67,16 @@ async def _search_items(lzt, s: dict) -> list[dict]:
 
 
 async def _fast_buy(lzt, item_id: int, price: float, balance_id: int):
-    kwargs = {"balance_id": balance_id} if balance_id else {}
-    try:
-        return await lzt.fast_buy(item_id, price, **kwargs)
-    except TypeError:
-        return await lzt.fast_buy(item_id, price)
+    """Pass a real balance id; without one LZT may charge the TG wallet."""
+    if balance_id:
+        try:
+            return await lzt.fast_buy(item_id, price, balance_id=balance_id)
+        except TypeError:
+            pass
+    return await lzt.fast_buy(item_id, price)
 
 
-async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict) -> str | None:
+async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str | None:
     """check → authoritative filter → balance for the *current* price → buy."""
     item_id = item["item_id"]
     search_price = db.num(item.get("price"))
@@ -96,17 +99,13 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict) -> str | None:
     if why == "ok_unknown":
         log.info(f"note {item_id}: fields unknown, relying on server filters")
 
-    try:
-        balances = await lzt.balances()
-    except LztError as e:
-        log.info(f"balance: {e}")
-        return None
-
-    wallet = pick_for_buy(balances, currency, price)
+    wallet = pick_for_buy(snap["entries"], currency, price)
     if wallet is None:
-        have = spendable(balances, currency)
+        snap = await wallet_view.snapshot(lzt, currency)
+        wallet = pick_for_buy(snap["entries"], currency, price)
+    if wallet is None:
         await _balance_warn(bot, tg_id,
-                            f"💳 Low balance {fmt_money(have, currency)} — buy paused")
+                            f"💳 Low balance {fmt_money(snap['total'], currency)} — buy paused")
         return None
 
     try:
@@ -237,17 +236,12 @@ async def _cycle(bot, lzt, tg_id: int, s: dict):
     currency = s["currency"]
     floor_price = db.num(s.get("price_min"))
 
-    try:
-        balances = await lzt.balances()
-    except LztError as e:
-        await db.save_report(tg_id, error=f"balances: {e}")
-        return
-
-    have = spendable(balances, currency)
-    if have < floor_price:
+    snap = await wallet_view.snapshot(lzt, currency)
+    if snap["spendable"] < floor_price:
         await _balance_warn(bot, tg_id,
-                            f"💳 Low balance {fmt_money(have, currency)} — buy paused")
-        await db.save_report(tg_id, note=f"low balance {have:.2f}")
+                            f"💳 Low balance {fmt_money(snap['total'], currency)} — buy paused")
+        await db.save_report(tg_id, note=f"low spendable {snap['spendable']:.2f}"
+                            + (f" · {snap['error'][:80]}" if snap["error"] else ""))
         return
 
     try:
@@ -265,7 +259,7 @@ async def _cycle(bot, lzt, tg_id: int, s: dict):
         if not ok:
             reasons[why] += 1
             continue
-        if await buy_one(bot, lzt, tg_id, it, s):
+        if await buy_one(bot, lzt, tg_id, it, s, snap):
             bought += 1
         else:
             reasons["buy_failed"] += 1

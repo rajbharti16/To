@@ -1,4 +1,6 @@
 """MongoDB storage layer (pymongo async)."""
+import logging
+import re
 import time
 
 from bson import ObjectId
@@ -6,6 +8,8 @@ from bson.errors import InvalidId
 from pymongo import ASCENDING, AsyncMongoClient
 
 from app.config import MONGO_DB, MONGO_URI
+
+log = logging.getLogger("db")
 
 DEFAULTS = {
     "price_min": "0.05", "price_max": "1.00",
@@ -17,6 +21,9 @@ DEFAULTS = {
     "terminate_on_expire": "1", "change_mail_on_expire": "1",
     "verify_spam": "1", "currency": "usd", "proxy": "", "mail_provider": "auto",
 }
+
+_TRUE = {"1", "true", "yes", "on", "y"}
+_FALSE = {"0", "false", "no", "off", "n", ""}
 
 _client: AsyncMongoClient | None = None
 _db = None
@@ -32,6 +39,123 @@ def _oid(pid):
     except (InvalidId, TypeError):
         return None
 
+
+# ---------- value coercion (public: engine/UI reuse these) ----------
+
+def num(value, default: float = 0.0) -> float:
+    try:
+        return float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def intval(value, default: int = 0) -> int:
+    try:
+        return int(num(value, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _fmt(f: float) -> str:
+    return f"{f:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def _f(default: str, lo: float | None = None, hi: float | None = None):
+    def norm(v) -> str:
+        try:
+            f = float(str(v).replace(",", ".").strip())
+        except (TypeError, ValueError):
+            return default
+        if lo is not None:
+            f = max(lo, f)
+        if hi is not None:
+            f = min(hi, f)
+        return _fmt(f)
+    return norm
+
+
+def _i(default: str, lo: int | None = None, hi: int | None = None):
+    def norm(v) -> str:
+        try:
+            i = int(float(str(v).replace(",", ".").strip()))
+        except (TypeError, ValueError):
+            return default
+        if lo is not None:
+            i = max(lo, i)
+        if hi is not None:
+            i = min(hi, i)
+        return str(i)
+    return norm
+
+
+def _enum(allowed: tuple[str, ...], default: str):
+    def norm(v) -> str:
+        t = str(v).strip().lower()
+        return t if t in allowed else default
+    return norm
+
+
+def _flag(default: str = "0"):
+    def norm(v) -> str:
+        t = str(v).strip().lower()
+        if t in _TRUE:
+            return "1"
+        if t in _FALSE:
+            return "0"
+        return default
+    return norm
+
+
+def _codes(v) -> str:
+    seen = {c.strip().upper() for c in str(v or "").split(",") if c.strip()}
+    return ",".join(sorted(seen))
+
+
+NORMALIZERS = {
+    "price_min": _f(DEFAULTS["price_min"], 0.0),
+    "price_max": _f(DEFAULTS["price_max"], 0.0),
+    "spam_mode": _enum(("yes", "no", "any"), "no"),
+    "mail_mode": _enum(("yes", "no", "any"), "yes"),
+    "mail_type": _enum(("any", "native", "temp"), "any"),
+    "password_mode": _enum(("yes", "no", "any"), "no"),
+    "session_min_hours": _f("0", 0.0, 87600.0),
+    "session_life_hours": _f("24", 0.0, 87600.0),
+    "countries": _codes,
+    "deny_countries": _codes,
+    "nsb_only": _flag("1"),
+    "max_buy_per_cycle": _i("2", 1, 100),
+    "daily_spend_cap": _f("15", 0.0),
+    "poll_interval": _i("25", 5, 3600),
+    "auto_buy": _flag("0"),
+    "terminate_on_expire": _flag("1"),
+    "change_mail_on_expire": _flag("1"),
+    "verify_spam": _flag("1"),
+    "currency": _enum(("usd", "rub", "uah", "eur", "kzt", "byn", "gbp"), "usd"),
+    "proxy": lambda v: str(v or "").strip()[:300],
+    "mail_provider": _enum(("auto", "native", "temp"), "auto"),
+}
+
+
+def normalize_setting(key: str, value) -> str | None:
+    fn = NORMALIZERS.get(key)
+    return None if fn is None else fn(value)
+
+
+def normalize_settings(raw: dict) -> tuple[dict, dict]:
+    """(clean, fixes). fixes holds only keys that had to be repaired."""
+    clean, fixes = {}, {}
+    for key, default in DEFAULTS.items():
+        norm = NORMALIZERS[key](raw.get(key, default))
+        if key in raw and norm != str(raw.get(key)):
+            fixes[key] = norm
+        clean[key] = norm
+    if num(clean["price_max"]) < num(clean["price_min"]):
+        clean["price_max"] = clean["price_min"]
+        fixes["price_max"] = clean["price_max"]
+    return clean, fixes
+
+
+# ---------- lifecycle ----------
 
 async def init_db():
     global _client, _db
@@ -51,27 +175,44 @@ async def close_db():
 async def ensure_user(tg_id: int, username: str = ""):
     await _db.users.update_one(
         {"_id": tg_id}, {"$setOnInsert": {"username": username, "created_at": _now()}}, upsert=True)
+    clean, _ = normalize_settings({})
     await _db.settings.update_one(
-        {"tg_id": tg_id}, {"$setOnInsert": {**DEFAULTS, "tg_id": tg_id}}, upsert=True)
+        {"tg_id": tg_id}, {"$setOnInsert": {**clean, "tg_id": tg_id}}, upsert=True)
 
+
+# ---------- settings ----------
 
 async def get_settings(tg_id: int) -> dict:
     doc = await _db.settings.find_one({"tg_id": tg_id})
     if not doc:
-        await _db.settings.insert_one({**DEFAULTS, "tg_id": tg_id})
-        return dict(DEFAULTS)
-    doc.pop("_id", None)
-    doc.pop("tg_id", None)
-    return {**DEFAULTS, **doc}
+        clean, _ = normalize_settings({})
+        await _db.settings.update_one(
+            {"tg_id": tg_id}, {"$setOnInsert": {**clean, "tg_id": tg_id}}, upsert=True)
+        return clean
+    clean, fixes = normalize_settings(doc)
+    if fixes:
+        await _db.settings.update_one({"tg_id": tg_id}, {"$set": fixes})
+        log.info(f"settings repaired tg={tg_id} keys={sorted(fixes)}")
+    return clean
 
 
-async def set_setting(tg_id: int, key: str, value: str):
-    await _db.settings.update_one({"tg_id": tg_id}, {"$set": {key: str(value)}}, upsert=True)
+async def set_setting(tg_id: int, key: str, value) -> str | None:
+    """Stores the normalized value. Returns it, or None for an unknown key."""
+    norm = normalize_setting(key, value)
+    if norm is None:
+        return None
+    await _db.settings.update_one(
+        {"tg_id": tg_id},
+        {"$set": {key: norm}, "$setOnInsert": {"tg_id": tg_id}},
+        upsert=True)
+    return norm
 
 
 async def all_owners() -> list[dict]:
     return await _db.users.find({}, {"_id": 1}).to_list(None)
 
+
+# ---------- spending / purchases ----------
 
 async def spent_today(tg_id: int) -> float:
     cursor = await _db.purchases.aggregate([
@@ -102,9 +243,10 @@ async def add_purchase(tg_id, item_id, phone, country, price, mail="", mail_pass
     return str(pid)
 
 
-async def due_purchases() -> list[dict]:
+async def due_purchases(limit: int = 200) -> list[dict]:
     return await _db.purchases.find(
-        {"status": "active", "expires_at": {"$gt": 0, "$lte": _now()}}).to_list(None)
+        {"status": "active", "expires_at": {"$gt": 0, "$lte": _now()}}
+    ).limit(limit).to_list(None)
 
 
 async def active_purchases(tg_id: int) -> list[dict]:
@@ -122,8 +264,9 @@ async def get_purchase(pid) -> dict | None:
 
 
 async def find_by_phone(tg_id: int, needle: str) -> dict | None:
+    pattern = re.escape(needle.strip().lstrip("+"))
     return await _db.purchases.find_one(
-        {"tg_id": tg_id, "phone": {"$regex": needle.lstrip("+")}}, sort=[("_id", -1)])
+        {"tg_id": tg_id, "phone": {"$regex": pattern}}, sort=[("_id", -1)])
 
 
 async def set_session(pid, session_string: str):
@@ -135,7 +278,7 @@ async def set_session(pid, session_string: str):
 async def bump_expiry(pid, seconds: int):
     oid = _oid(pid)
     if oid:
-        await _db.purchases.update_one({"_id": oid}, {"$inc": {"expires_at": seconds}})
+        await _db.purchases.update_one({"_id": oid}, {"$inc": {"expires_at": int(seconds)}})
 
 
 async def close_purchase(pid, status: str, note: str = "", new_mail: str = ""):
@@ -171,26 +314,17 @@ async def ledger_stats(tg_id: int) -> dict:
             "_id": None,
             "total": {"$sum": 1},
             "spent": {"$sum": "$buy_price"},
-            "revenue": {"$sum": "$sell_price"}
+            "revenue": {"$sum": "$sell_price"},
         }},
     ])
-
     res = await cursor.to_list(length=1)
-
-    row = res[0] if res else {
-        "total": 0,
-        "spent": 0.0,
-        "revenue": 0.0
-    }
+    row = res[0] if res else {"total": 0, "spent": 0.0, "revenue": 0.0}
 
     spent = float(row["spent"])
     revenue = float(row["revenue"])
     profit = revenue - spent
-
-    done = await _db.ledger.count_documents({
-        "tg_id": tg_id,
-        "status": {"$in": ["terminated", "sold"]}
-    })
+    done = await _db.ledger.count_documents(
+        {"tg_id": tg_id, "status": {"$in": ["terminated", "sold"]}})
 
     return {
         "total": int(row["total"]),
@@ -198,5 +332,5 @@ async def ledger_stats(tg_id: int) -> dict:
         "revenue": revenue,
         "profit": profit,
         "roi": (profit / spent * 100) if spent else 0.0,
-        "done": done
+        "done": done,
     }

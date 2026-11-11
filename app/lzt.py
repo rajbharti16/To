@@ -102,7 +102,6 @@ class LztClient:
             self._last_search = time.time()
             return await self._req("GET", "/telegram", params=params)
 
-    # ── profile / wallet ────────────────────────────────────────────────────
     async def me_raw(self) -> dict:
         return await self._req("GET", "/me")
 
@@ -172,7 +171,6 @@ class LztClient:
         data = await self._req("GET", "/user/payments", params=params)
         return self._store(key, data.get("payments") or data.get("operations") or [])
 
-    # ── market ──────────────────────────────────────────────────────────────
     async def search(self, s: dict, cursor: str = None) -> list[dict]:
         p = {
             "pmin": s["price_min"], "pmax": s["price_max"],

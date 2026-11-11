@@ -4,19 +4,28 @@ Two phases:
   passes(item, s)                      -> pre-check, search result fields only
   passes(item, s, authoritative=True)  -> post-check, full check-account payload
 
-The search endpoint returns a reduced item: no telegram_spam_block, no
-telegram_password, no country, no session age. Anything missing is treated as
-"unknown" and never rejects — the server-side query already filtered it.
+Age is derived from the account's real creation timestamp first (created_at /
+registration_date and friends), then from session-age fields, then from the
+title text. Anything missing stays "unknown" and never rejects.
 """
 from __future__ import annotations
 
 import re
+import time
+
+from app.utils.timeutil import age_hours, parse_ts
 
 TARGET_FALLBACK = 24.0
 
 _FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 _COUNTRY_RE = re.compile(r"\(([A-Z]{2})\)")
 _PHONE_RE = re.compile(r"\+\d{6,16}")
+
+_CREATED_KEYS = (
+    "created_at", "creation_date", "registration_date", "telegram_registration_date",
+    "telegram_created_at", "registered_at", "item_created_at", "account_created_at",
+)
+_CREATED_NESTED = ("item_origin", "origin", "telegram", "item", "meta", "account")
 
 _AGE_NUM_KEYS = (
     "telegram_session_age",
@@ -43,7 +52,7 @@ _AGE_TEXT_RES = (
         r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?"
     ),
     re.compile(
-        r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?\s*(?:session|сесси[яи])"
+        r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?\s*(?:session|сесси[ия])"
     ),
 )
 
@@ -57,18 +66,23 @@ def _num(value) -> float | None:
         return None
 
 
+_TRUE = {"1", "true", "yes", "y", "on", "да"}
+_FALSE = {"0", "false", "no", "n", "off", ""}
+
+
 def _as_bool(value) -> bool | None:
-    """Tri-state: True / False / None (unknown)."""
+    """Tri-state: True / False / None (unknown). Free text counts as True."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
         t = value.strip().lower()
-        if t in ("1", "true", "yes", "y", "on"):
+        if t in _TRUE:
             return True
-        if t in ("0", "false", "no", "n", "off", ""):
+        if t in _FALSE:
             return False
+        return True          # e.g. an actual address
     return None
 
 
@@ -93,6 +107,24 @@ def country_of(item: dict) -> str:
 def phone_of(item: dict) -> str:
     m = _PHONE_RE.search(item.get("title", "") or "")
     return m.group(0) if m else ""
+
+
+def account_created_ts(item: dict, depth: int = 0) -> int | None:
+    """Epoch seconds of the account creation, from any plausible field."""
+    if depth > 3 or not isinstance(item, dict):
+        return None
+    for key in _CREATED_KEYS:
+        if key in item:
+            ts = parse_ts(item[key])
+            if ts and ts <= time.time() + 86_400:
+                return ts
+    for key in _CREATED_NESTED:
+        nested = item.get(key)
+        if isinstance(nested, dict):
+            ts = account_created_ts(nested, depth + 1)
+            if ts:
+                return ts
+    return None
 
 
 def _period_hours(item: dict) -> float | None:
@@ -134,7 +166,7 @@ def _age_from_text(item: dict) -> float | None:
 
 
 def session_hours(item: dict) -> float | None:
-    """Age of the session in hours, or None when it cannot be determined."""
+    """Session age in hours, from age fields or the title. None when unknown."""
     for key in _AGE_NUM_KEYS:
         raw = item.get(key)
         v = _num(raw)
@@ -143,12 +175,20 @@ def session_hours(item: dict) -> float | None:
         mult = _period_hours(item) or _unit_from_key(key)
         if mult:
             return v * mult
-        if v > 100_000:
+        if v > 100_000:      # plainly seconds
             return v / 3600
-        if v > 1_000:
+        if v > 1_000:        # plainly hours
             return v
-        return v * 24.0
+        return v * 24.0      # LZT default unit is days
     return _age_from_text(item)
+
+
+def age_hours_of(item: dict, at: int | None = None) -> float | None:
+    """Authoritative age: real creation time first, session age as fallback."""
+    created = account_created_ts(item)
+    if created:
+        return age_hours(created, at)
+    return session_hours(item)
 
 
 def search_query(s: dict) -> dict:
@@ -170,17 +210,17 @@ def mail_state(item: dict) -> bool | None:
     flag = _as_bool(item.get("telegram_email"))
     if flag is not None:
         return flag
-    et = item.get("email_type")
-    if et is None:
-        return None
-    return str(et).strip().lower() not in ("", "no")
+    if "email_type" in item:
+        et = str(item.get("email_type") or "").strip().lower()
+        return et not in ("", "no", "none")
+    return None
 
 
 def pass_state(item: dict) -> bool | None:
-    pw = item.get("telegram_password")
-    if pw is None:
-        return None
-    return bool(str(pw).strip())
+    for key in ("telegram_password", "password", "has_password"):
+        if key in item:
+            return bool(str(item.get(key) or "").strip())
+    return None
 
 
 def _codes(raw: str) -> set[str]:
@@ -195,9 +235,18 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
     if price > (_num(s.get("price_max")) or float("inf")):
         return False, "price_max"
 
-    nsb = _as_bool(item.get("nsb"))
-    if s.get("nsb_only") == "1" and nsb is False:
+    if s.get("nsb_only") == "1" and _as_bool(item.get("nsb")) is False:
         return False, "resold"
+
+    floor = _num(s.get("session_min_hours")) or 0.0
+    cap = _num(s.get("session_max_hours")) or 0.0
+    if floor or cap:
+        age = age_hours_of(item)
+        if age is not None:
+            if floor and age < floor:
+                return False, "session_too_fresh"
+            if cap and age > cap:
+                return False, "session_too_old"
 
     if not authoritative:
         return True, "ok"
@@ -241,18 +290,17 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
     else:
         unknown = True
 
-    floor = _num(s.get("session_min_hours")) or 0.0
-    if floor:
-        age = session_hours(item)
-        if age is None:
-            unknown = True
-        elif age < floor:
-            return False, "session_too_fresh"
+    if floor and age_hours_of(item) is None:
+        unknown = True
 
     return True, ("ok_unknown" if unknown else "ok")
 
 
-def clean_delay_hours(item: dict, target: float = TARGET_FALLBACK) -> float:
-    """Hours to wait before cleaning. 0.0 means clean immediately."""
-    age = session_hours(item) or 0.0
-    return max(0.0, float(target) - age)
+def clean_delay_hours(item: dict, target: float = TARGET_FALLBACK,
+                      early: bool = True) -> float:
+    """Hours to wait before cleaning, capped at `target`."""
+    target = max(0.0, float(target))
+    if not early:
+        return target
+    age = age_hours_of(item) or 0.0
+    return min(target, max(0.0, target - age))

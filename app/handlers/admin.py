@@ -25,7 +25,9 @@ async def cmd_sold(m: Message):
     if len(parts) < 3:
         return await m.answer("Usage: /sold <purchase_id> <price>")
     try:
-        await db.mark_sold(parts[1], float(parts[2]))
+        price = float(parts[2])
     except ValueError:
         return await m.answer("❌ Price must be a number")
-    await m.answer(f"✅ Marked sold for ${parts[2]}")
+    if not await db.mark_sold(parts[1], price):
+        return await m.answer("❌ purchase not found")
+    await m.answer(f"✅ Marked sold for ${price:g}")

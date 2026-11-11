@@ -8,13 +8,13 @@ from app import db
 from app.config import EXPIRY_LOGIN_GRACE, EXPIRY_RETRY, EXPIRY_RETRY_DELAY, TICK
 from app.lzt import LztError
 from app.mail_engine import IMAPMailClient, TempMailClient
-from app.session_manager import change_email, check_session, client, login_with_lzt, terminate
+from app.session_manager import change_email, client, login_with_lzt, terminate
 from app.utils import wallet as wallet_view
 from app.utils.filters import (
     account_created_ts, age_hours_of, clean_delay_hours, country_of, passes, phone_of,
     search_query,
 )
-from app.utils.money import fmt_money, free_of, pick_for_buy
+from app.utils.money import fmt_money, pick_for_buy
 
 log = logging.getLogger("engine")
 
@@ -67,17 +67,20 @@ async def _search_items(lzt, s: dict) -> list[dict]:
 
 
 async def _fast_buy(lzt, item_id: int, price: float, balance_id: int):
-    """Pass a real balance id; without one LZT may charge the TG wallet."""
+    """Real id first; retry without it if the id is rejected, then without id."""
     if balance_id:
         try:
             return await lzt.fast_buy(item_id, price, balance_id=balance_id)
         except TypeError:
             pass
+        except LztError as e:
+            if "balance" not in str(e).lower():
+                raise
+            log.info(f"buy {item_id}: balance id rejected ({e}), retrying default")
     return await lzt.fast_buy(item_id, price)
 
 
 async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str | None:
-    """check → authoritative filter → balance for the *current* price → buy."""
     item_id = item["item_id"]
     search_price = db.num(item.get("price"))
     currency = s["currency"]
@@ -105,7 +108,8 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str 
         wallet = pick_for_buy(snap["entries"], currency, price)
     if wallet is None:
         await _balance_warn(bot, tg_id,
-                            f"💳 Low balance {fmt_money(snap['total'], currency)} — buy paused")
+                            f"💳 Low balance {fmt_money(snap['total'], currency)}"
+                            f" for {fmt_money(price, currency)}")
         return None
 
     try:
@@ -152,7 +156,6 @@ async def _login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay):
 
 
 async def _mail_client_for(p: dict, s: dict):
-    """(client, address) — reuse the account mailbox when possible, else temp."""
     current = (p.get("mail") or "").split("@")[-1].lower()
     provider = s.get("mail_provider", "auto")
     if provider in ("auto", "native") and p.get("mail") and p.get("mail_password"):
@@ -228,10 +231,17 @@ async def expire_purchase(bot, lzt, p: dict):
 
 
 async def _cycle(bot, lzt, tg_id: int, s: dict):
-    cap = db.num(s.get("daily_spend_cap"))
-    if cap > 0 and await db.spent_today(tg_id) >= cap:
-        await db.save_report(tg_id, note="daily cap reached")
+    """One scan. Every early return leaves a reason in the report."""
+    if s.get("auto_buy") != "1":
+        await db.save_report(tg_id, note="auto-buy off")
         return
+
+    cap = db.num(s.get("daily_spend_cap"))
+    if cap > 0:
+        spent = await db.spent_today(tg_id)
+        if spent >= cap:
+            await db.save_report(tg_id, note=f"daily cap hit {spent:.2f}/{cap:.2f}")
+            return
 
     currency = s["currency"]
     floor_price = db.num(s.get("price_min"))
@@ -239,15 +249,21 @@ async def _cycle(bot, lzt, tg_id: int, s: dict):
     snap = await wallet_view.snapshot(lzt, currency)
     if snap["spendable"] < floor_price:
         await _balance_warn(bot, tg_id,
-                            f"💳 Low balance {fmt_money(snap['total'], currency)} — buy paused")
-        await db.save_report(tg_id, note=f"low spendable {snap['spendable']:.2f}"
-                            + (f" · {snap['error'][:80]}" if snap["error"] else ""))
+                            f"💳 Low balance {fmt_money(snap['total'], currency)}"
+                            f" · spendable {fmt_money(snap['spendable'], currency)}")
+        note = f"low spendable {snap['spendable']:.2f}/{floor_price:.2f}"
+        if snap["error"]:
+            note += f" · {snap['error'][:80]}"
+        await db.save_report(tg_id, note=note)
         return
 
     try:
         items = await _search_items(lzt, s)
     except LztError as e:
         await db.save_report(tg_id, error=f"search: {e}")
+        return
+    if not items:
+        await db.save_report(tg_id, note="search returned nothing")
         return
 
     reasons: Counter = Counter()

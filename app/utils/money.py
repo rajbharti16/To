@@ -1,4 +1,5 @@
 """Balance parsing that survives unknown payload shapes."""
+import re
 from decimal import Decimal, InvalidOperation
 
 SYMBOLS = {"usd": "$", "eur": "€", "rub": "₽", "uah": "₴", "gbp": "£",
@@ -7,17 +8,16 @@ SYMBOLS = {"usd": "$", "eur": "€", "rub": "₽", "uah": "₴", "gbp": "£",
 ALIASES = {"usdt": "usd", "usdc": "usd", "busd": "usd", "usdtt": "usd",
            "rubr": "rub", "eurc": "eur"}
 
-TELEGRAM_MARKERS = ("telegram", "tg", "wallet")
-MARKET_MARKERS = ("market", "main", "trade", "spend")
-
 CUR_KEYS = ("currency", "cur", "code", "currency_code")
 AMT_KEYS = ("balance", "amount", "value", "sum", "available", "free")
 HOLD_KEYS = ("hold", "held", "frozen", "pending", "locked")
 ID_KEYS = ("balance_id", "id", "wallet_id", "balanceid")
 
-# only these describe what a balance *is* — avoids "tg" matching inside usernames
 _ID_FIELDS = ("balance_type", "type", "kind", "slug", "title", "name", "label",
               "description", "payment_method")
+
+_WALLET_TOKENS = {"wallet", "tg", "telegram", "tgwallet"}
+_MARKET_TOKENS = {"market", "main", "trade", "trading", "spend"}
 
 
 def canon(currency: str) -> str:
@@ -68,14 +68,21 @@ def _pick(d: dict, keys) -> tuple[str | None, object]:
     return None, None
 
 
+def _tokens(text: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if t}
+
+
 def _kind(d: dict) -> str:
-    """Classify by identity fields only; everything else is generic."""
-    raw = " ".join(str(d.get(k)).lower() for k in _ID_FIELDS if d.get(k) not in (None, ""))
-    if not raw:
-        raw = " ".join(str(v).lower() for v in d.values() if isinstance(v, str))
-    if any(m in raw for m in TELEGRAM_MARKERS):
+    """Only identity fields decide. No identity info → treat as usable."""
+    raw = " ".join(str(d.get(k)) for k in _ID_FIELDS if d.get(k) not in (None, ""))
+    if not raw.strip():
+        return "other"
+    toks = _tokens(raw)
+    if "telegram" in raw.lower() or toks & {"tg", "tgwallet"}:
         return "telegram"
-    if any(m in raw for m in MARKET_MARKERS):
+    if "wallet" in toks and not (toks & _MARKET_TOKENS):
+        return "telegram"
+    if toks & _MARKET_TOKENS:
         return "market"
     return "other"
 
@@ -119,7 +126,6 @@ def _walk(node, out: list, depth: int = 0):
 
 
 def parse_balances(payload: dict) -> list[dict]:
-    """Find every {currency, amount} object anywhere in the payload, deduped."""
     out: list[dict] = []
     _walk(payload or {}, out)
 
@@ -153,7 +159,6 @@ def spendable(balances: list[dict], currency: str) -> float:
 
 
 def total_of(payload: dict, currency: str) -> float:
-    """Real free money straight from the user object."""
     user = parse_user(payload)
     if same_currency(user["currency"], currency):
         return max(0.0, user["balance"] - user["hold"])

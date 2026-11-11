@@ -6,18 +6,21 @@ from app import db, keyboards as kb
 from app.deps import lzt
 from app.handlers.menu import show
 from app.lzt import LztError
-from app.session_manager import client, terminate
+from app.session_manager import check_session, client, terminate
 from app.utils.texts import session_detail, session_file
+from app.utils.timeutil import fmt_dt, now
 
 router = Router()
 
 
-async def _list(target) -> None:
+async def _list(target, cq: CallbackQuery | None = None):
     tg_id = target.from_user.id
     rows = await db.active_purchases(tg_id)
-    if not rows:
-        return await target.answer("no sessions queued", reply_markup=kb.back())
-    await target.answer(f"<b>Sessions</b> · {len(rows)}", reply_markup=kb.sessions(rows))
+    text = (f"<b>Sessions</b> · {len(rows)}" if rows else "no sessions queued")
+    markup = kb.sessions(rows) if rows else kb.back()
+    if cq:
+        return await show(cq, text, markup)
+    await target.answer(text, reply_markup=markup)
 
 
 @router.message(Command("session"))
@@ -33,7 +36,7 @@ async def cmd_session(m: Message):
 
 @router.callback_query(F.data == "m:sessions")
 async def cb_sessions(cq: CallbackQuery):
-    await _list(cq.message)
+    await _list(cq.message, cq)
     await cq.answer()
 
 
@@ -44,6 +47,27 @@ async def cb_view(cq: CallbackQuery):
         return await cq.answer("gone", show_alert=True)
     await show(cq, session_detail(p), kb.session_detail(p))
     await cq.answer()
+
+
+@router.callback_query(F.data.startswith("c:"))
+async def cb_check(cq: CallbackQuery):
+    pid = cq.data.split(":", 1)[1]
+    p = await db.get_purchase(pid)
+    if not p:
+        return await cq.answer("gone", show_alert=True)
+    if not p.get("session_string"):
+        return await cq.answer("no session stored yet", show_alert=True)
+
+    await cq.answer("checking…")
+    s = await db.get_settings(cq.from_user.id)
+    alive, me = await check_session(p["session_string"], s["proxy"])
+
+    note = "session live" if alive else "session dead"
+    if me:
+        note += f" · @{me.username or me.id}"
+    await db.set_purchase(pid, session_state="live" if alive else "dead", checked_at=now())
+    p = await db.get_purchase(pid)
+    await show(cq, session_detail(p, f"🔎 {note} · {fmt_dt(now())}"), kb.session_detail(p))
 
 
 @router.callback_query(F.data.startswith("f:"))
@@ -63,6 +87,7 @@ async def cb_kill(cq: CallbackQuery):
     p = await db.get_purchase(pid)
     if not p:
         return await cq.answer("gone", show_alert=True)
+
     await db.close_purchase(pid, "killed", "manual clean")
     if p.get("session_string"):
         try:
@@ -71,6 +96,11 @@ async def cb_kill(cq: CallbackQuery):
             await terminate(c)
         except Exception:
             pass
+        finally:
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
     try:
         await lzt.reset_authorizations(p["item_id"])
     except LztError:

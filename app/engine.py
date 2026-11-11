@@ -36,8 +36,7 @@ async def drain_bg(timeout: float = 5.0):
     if not _BG:
         return
     try:
-        await asyncio.wait_for(
-            asyncio.gather(*list(_BG), return_exceptions=True), timeout)
+        await asyncio.wait_for(asyncio.gather(*list(_BG), return_exceptions=True), timeout)
     except asyncio.TimeoutError:
         log.info(f"shutdown: {len(_BG)} login task(s) still running")
 
@@ -57,17 +56,14 @@ async def _balance_warn(bot, tg_id, text):
 
 
 async def _search_items(lzt, s: dict) -> list[dict]:
-    q = search_query(s)
-    if not q:
-        return await lzt.search(s)
-    try:
-        return await lzt.search({**s, **q})
-    except TypeError:
-        return await lzt.search(s)
+    q = dict(s)
+    age = search_query(s)
+    if age:
+        q.update(age)
+    return await lzt.search(q)
 
 
 async def _fast_buy(lzt, item_id: int, price: float, balance_id: int):
-    """Real id first; retry without it if the id is rejected, then without id."""
     if balance_id:
         try:
             return await lzt.fast_buy(item_id, price, balance_id=balance_id)
@@ -80,7 +76,7 @@ async def _fast_buy(lzt, item_id: int, price: float, balance_id: int):
     return await lzt.fast_buy(item_id, price)
 
 
-async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str | None:
+async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> tuple[bool, str]:
     item_id = item["item_id"]
     search_price = db.num(item.get("price"))
     currency = s["currency"]
@@ -89,7 +85,7 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str 
         chk = await lzt.check_account(item_id)
     except LztError as e:
         log.info(f"check {item_id}: {e}")
-        return None
+        return False, "check_failed"
 
     fresh = dict(item)
     fresh.update({k: v for k, v in (chk.get("item") or {}).items() if v not in (None, "")})
@@ -98,7 +94,7 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str 
     ok, why = passes(fresh, s, authoritative=True)
     if not ok:
         log.info(f"skip {item_id}: {why}")
-        return None
+        return False, why
     if why == "ok_unknown":
         log.info(f"note {item_id}: fields unknown, relying on server filters")
 
@@ -110,13 +106,13 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str 
         await _balance_warn(bot, tg_id,
                             f"💳 Low balance {fmt_money(snap['total'], currency)}"
                             f" for {fmt_money(price, currency)}")
-        return None
+        return False, "no_balance"
 
     try:
         res = await _fast_buy(lzt, item_id, price, int(wallet.get("balance_id") or 0))
     except LztError as e:
         log.info(f"buy {item_id}: {e}")
-        return None
+        return False, "buy_failed"
 
     login_data = (res.get("item") or {}).get("loginData") or {}
     phone = login_data.get("login") or phone_of(fresh) or phone_of(item)
@@ -134,7 +130,7 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> str 
         account_created_ts=created, note="bought")
 
     _spawn(_login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay))
-    return pid
+    return True, "bought"
 
 
 async def _login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay):
@@ -231,7 +227,6 @@ async def expire_purchase(bot, lzt, p: dict):
 
 
 async def _cycle(bot, lzt, tg_id: int, s: dict):
-    """One scan. Every early return leaves a reason in the report."""
     if s.get("auto_buy") != "1":
         await db.save_report(tg_id, note="auto-buy off")
         return
@@ -275,10 +270,11 @@ async def _cycle(bot, lzt, tg_id: int, s: dict):
         if not ok:
             reasons[why] += 1
             continue
-        if await buy_one(bot, lzt, tg_id, it, s, snap):
+        done, why = await buy_one(bot, lzt, tg_id, it, s, snap)
+        if done:
             bought += 1
         else:
-            reasons["buy_failed"] += 1
+            reasons[why] += 1
         if bought >= max_buys:
             break
         if cap > 0 and await db.spent_today(tg_id) >= cap:

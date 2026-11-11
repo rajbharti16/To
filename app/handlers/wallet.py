@@ -33,6 +33,12 @@ def _touch(st: dict):
     st["ts"] = time.time()
 
 
+def has_pending(uid: int) -> bool:
+    """True while an exchange waits for the amount. Used by handlers.filters."""
+    st = _st(uid)
+    return bool(st) and "to" in st
+
+
 def _usable(balances: list[dict]) -> list[dict]:
     return [b for b in balances if b.get("usable_for_buy")]
 
@@ -51,7 +57,7 @@ def _wallet_text(balances: list[dict]) -> str:
             row += " · not usable"
         lines.append(row)
     total_line = " · ".join(f"{fmt_money(v, c)}" for c, v in totals.items() if v > 0)
-    head = f"<b>Wallet</b>\n━━━━━━━━━━━━━━━━━━━━━━"
+    head = "<b>Wallet</b>\n━━━━━━━━━━━━━━━━━━━━━━"
     if total_line:
         head += f"\nfree: {total_line}"
     return head + "\n" + "\n".join(lines)
@@ -210,9 +216,7 @@ async def cmd_amount(m: Message):
     await m.answer(await _do(m.from_user.id, m.bot, amount))
 
 
-# NOTE: register this router BEFORE handlers/filters.py — its catch-all F.text
-# would otherwise swallow the amount. /amount works regardless of order.
-@router.message(F.text, lambda m: bool(_st(m.from_user.id)) and "to" in _st(m.from_user.id))
+@router.message(F.text, lambda m: has_pending(m.from_user.id))
 async def on_amount(m: Message):
     if (m.text or "").startswith("/"):
         return

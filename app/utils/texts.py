@@ -1,6 +1,5 @@
 """Message formatting — $ only, no TG wallet, no prices on buttons."""
 from app.config import API_HASH, API_ID
-from app.utils.filters import account_created_ts
 from app.utils.money import fmt_money
 from app.utils.timeutil import fmt_age, fmt_dt, fmt_left
 

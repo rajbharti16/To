@@ -5,10 +5,7 @@ from aiogram.types import CallbackQuery, Message
 from app import db, keyboards as kb
 from app.config import OWNER_IDS
 from app.deps import lzt
-from app.engine import buy_one
 from app.lzt import LztError
-from app.utils.filters import passes
-from app.utils.money import fmt_money
 from app.utils.texts import menu_text
 
 router = Router()
@@ -25,29 +22,30 @@ async def show(cq: CallbackQuery, text: str, markup):
         await cq.message.answer(text, reply_markup=markup)
 
 
-async def live_state():
+async def render_menu(tg_id: int) -> tuple[str, object]:
+    s = await db.get_settings(tg_id)
     try:
-        return await lzt.profile(), await lzt.balances()
+        profile = await lzt.profile()
+        balance = await lzt.balance_total(s["currency"])
     except LztError:
-        return {"username": "unreachable", "user_id": 0, "sympathies": 0,
-                "balance": 0.0, "hold": 0.0, "currency": "usd"}, []
+        profile, balance = {"username": "offline"}, 0.0
+    queued = await db.queue_count(tg_id)
+    return menu_text(s, profile, balance, queued), kb.main(s)
 
 
 @router.message(Command("start"))
 async def cmd_start(m: Message):
     if not allowed(m.from_user.id):
-        return await m.answer(f"⛔️ Not allowed. Your id: <code>{m.from_user.id}</code>")
+        return await m.answer(f"Not allowed. id <code>{m.from_user.id}</code>")
     await db.ensure_user(m.from_user.id, m.from_user.username or "")
-    s = await db.get_settings(m.from_user.id)
-    profile, balances = await live_state()
-    await m.answer(menu_text(s, profile, balances), reply_markup=kb.main(s, balances))
+    text, markup = await render_menu(m.from_user.id)
+    await m.answer(text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "m:main")
 async def cb_main(cq: CallbackQuery):
-    s = await db.get_settings(cq.from_user.id)
-    profile, balances = await live_state()
-    await show(cq, menu_text(s, profile, balances), kb.main(s, balances))
+    text, markup = await render_menu(cq.from_user.id)
+    await show(cq, text, markup)
     await cq.answer()
 
 
@@ -57,35 +55,10 @@ async def cb_toggle(cq: CallbackQuery):
     s = await db.get_settings(cq.from_user.id)
     new = "0" if s[key] == "1" else "1"
     await db.set_setting(cq.from_user.id, key, new)
-    s = await db.get_settings(cq.from_user.id)
     if key == "auto_buy":
-        profile, balances = await live_state()
-        return await show(cq, menu_text(s, profile, balances), kb.main(s, balances))
-    await show(cq, "🎛 <b>Filters</b>", kb.filters(s))
-    await cq.answer(f"{key}: {'ON' if new == '1' else 'OFF'}")
-
-
-@router.callback_query(F.data == "go")
-async def cb_go(cq: CallbackQuery):
-    await cq.answer("scanning…")
+        text, markup = await render_menu(cq.from_user.id)
+        return await show(cq, text, markup)
     s = await db.get_settings(cq.from_user.id)
-    try:
-        wallet = await lzt.balance_for_buy(s["currency"], float(s["price_min"]))
-    except LztError as e:
-        return await cq.message.answer(f"❌ Balance unavailable: {e}")
-    if wallet is None:
-        total = await lzt.balance_total(s["currency"])
-        return await cq.message.answer(
-            f"💳 Low market balance {fmt_money(total, s['currency'])} — top up or run /walletdebug")
-
-    try:
-        items = await lzt.search(s)
-    except LztError as e:
-        return await cq.message.answer(f"❌ Search failed: {e}")
-
-    for it in items[:40]:
-        if not passes(it, s)[0]:
-            continue
-        if await buy_one(cq.bot, lzt, cq.from_user.id, it, s):
-            return await cq.message.answer(f"✅ Bought {it['item_id']}")
-    await cq.message.answer("😕 No matching account right now")
+    from app.utils.texts import filters_text
+    await show(cq, filters_text(s), kb.filters(s))
+    await cq.answer("saved")

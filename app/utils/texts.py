@@ -2,21 +2,21 @@
 from app.config import API_HASH, API_ID
 from app.utils.filters import account_created_ts
 from app.utils.money import fmt_money
-from app.utils.timeutil import fmt_age, fmt_dt, fmt_left, now
+from app.utils.timeutil import fmt_age, fmt_dt, fmt_left
 
 
-def _age_at_buy(p: dict) -> str:
-    created = p.get("account_created_ts") or account_created_ts(p)
-    return fmt_dt(created) if created else "unknown"
-
-
-def menu_text(s: dict, profile: dict, balance: float, queued: int) -> str:
-    return (
+def menu_text(s: dict, profile: dict, total: float, spendable: float,
+              queued: int, note: str = "") -> str:
+    body = (
         "<b>AccStore</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 {profile.get('username', '?')}\n"
-        f"💵 <b>{fmt_money(balance, s['currency'])}</b> spendable\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>{fmt_money(total, s['currency'])}</b>"
+    )
+    if spendable + 1e-9 < total:
+        body += f" · {fmt_money(spendable, s['currency'])} spendable"
+    body += (
+        "\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 running' if s['auto_buy'] == '1' else '🔴 stopped'}"
         f" · queue {queued}\n"
         f"price {s['price_min']}–{s['price_max']} · spam {s['spam_mode']}\n"
@@ -25,6 +25,9 @@ def menu_text(s: dict, profile: dict, balance: float, queued: int) -> str:
         f"mail {s['mail_mode']} · 2fa {s['password_mode']}\n"
         f"include {s['countries'] or 'all'} · exclude {s['deny_countries'] or '—'}"
     )
+    if note:
+        body += f"\n⚠️ {note}"
+    return body
 
 
 def filters_text(s: dict) -> str:
@@ -52,8 +55,28 @@ def limits_text(s: dict) -> str:
     )
 
 
-def session_line(p: dict) -> str:
-    return f"📱 {p.get('phone') or p['item_id']} · {fmt_left(p.get('expires_at'))}"
+def wallet_text(snap: dict) -> str:
+    total, spend = snap["total"], snap["spendable"]
+    head = "<b>Wallet</b> · market\n━━━━━━━━━━━━━━━━━━━━━━"
+    head += f"\nbalance <b>{fmt_money(total, snap['currency'])}</b>"
+    if spend + 1e-9 < total:
+        head += f"\nspendable {fmt_money(spend, snap['currency'])}"
+
+    lines = []
+    for b in snap["entries"]:
+        row = f"• {b['label']} {fmt_money(b.get('amount', 0.0), b['currency'])}"
+        if b.get("hold"):
+            row += f" · hold {fmt_money(b['hold'], b['currency'])}"
+        if not b["usable_for_buy"]:
+            row += " · not usable"
+        lines.append(row)
+
+    body = head + ("\n" + "\n".join(lines) if lines else "\nno balance entries")
+    if snap.get("note"):
+        body += f"\n<i>{snap['note']}</i>"
+    if snap.get("error"):
+        body += f"\n⚠️ <code>{snap['error'][:120]}</code>"
+    return body
 
 
 def session_detail(p: dict, checked: str = "") -> str:

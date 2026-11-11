@@ -1,4 +1,13 @@
 
+Check whole code properly fix buy problem jasai buy kre session bhi de and 24 hr mai auto logout kre filteration fix kro proper created time mai session check kre time properly and properly report kre and edit kre vhi button ko nh ki new wpis khule and working kro and aur jo jo issues hai and kuch new implement Krna vo bhi krdo and all files jo jo fix krni usse rewrite kro entire fix properly.
+
+
+
+app/handlers/__init__.py
+
+from app.handlers import admin, filters, ledger, menu, sessions, wallet
+
+ROUTERS = (menu.router, wallet.router, filters.router, sessions.router, ledger.router, admin.router)
 
 app/handlers/wallet.py
 

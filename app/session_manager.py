@@ -1,4 +1,4 @@
-"""Telethon: login via LZT code, change mail, terminate session."""
+"""Telethon: login via LZT code, session check, change mail, terminate."""
 import asyncio
 import logging
 import re
@@ -10,6 +10,9 @@ from telethon.sessions import StringSession
 from app.config import API_HASH, API_ID, CODE_TIMEOUT
 
 log = logging.getLogger("session")
+
+DEVICE = dict(device_model="AccStore", system_version="1.0",
+              app_version="1.0", lang_code="en")
 
 
 def _proxy(cfg: str):
@@ -26,39 +29,66 @@ def _proxy(cfg: str):
 
 def client(session_string: str = "", proxy_cfg: str = ""):
     return TelegramClient(StringSession(session_string), API_ID, API_HASH,
-                          proxy=_proxy(proxy_cfg), connection_retries=3, timeout=30)
+                          proxy=_proxy(proxy_cfg), connection_retries=3, timeout=30,
+                          **DEVICE)
 
 
 async def login_with_lzt(phone: str, password: str, item_id: int, lzt, proxy_cfg: str = ""):
     c = client("", proxy_cfg)
     await c.connect()
-    sent = await c.send_code_request(phone)
-
-    loop = asyncio.get_running_loop()
-    start = loop.time()
-    code = None
-    while loop.time() - start < CODE_TIMEOUT:
-        got, _ = await lzt.telegram_login_code(item_id)
-        if got and len(got) >= 4:
-            code = got
-            break
-        await asyncio.sleep(5)
-    if not code:
-        await c.disconnect()
-        raise RuntimeError("LZT login code not received")
-
     try:
-        await c.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
-    except SessionPasswordNeededError:
-        if not password:
-            raise RuntimeError("2FA required but no password on item")
-        await c.sign_in(password=password)
+        sent = await c.send_code_request(phone)
 
-    if not await c.is_user_authorized():
-        raise RuntimeError("not authorized after sign_in")
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        code = None
+        while loop.time() - start < CODE_TIMEOUT:
+            got, _ = await lzt.telegram_login_code(item_id)
+            if got and len(got) >= 4:
+                code = got
+                break
+            await asyncio.sleep(5)
+        if not code:
+            raise RuntimeError("LZT login code not received")
 
-    me = await c.get_me()
-    return c, c.session.save(), me.id
+        try:
+            await c.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
+        except SessionPasswordNeededError:
+            if not password:
+                raise RuntimeError("2FA required but no password on item")
+            await c.sign_in(password=password)
+
+        if not await c.is_user_authorized():
+            raise RuntimeError("not authorized after sign_in")
+
+        me = await c.get_me()
+        return c, c.session.save(), me.id
+    except Exception:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+        raise
+
+
+async def check_session(session_string: str, proxy_cfg: str = ""):
+    """(alive, me) — connects, verifies authorization, always disconnects."""
+    if not session_string:
+        return False, None
+    c = client(session_string, proxy_cfg)
+    try:
+        await c.connect()
+        if not await c.is_user_authorized():
+            return False, None
+        return True, await c.get_me()
+    except Exception as e:
+        log.info(f"check_session: {e}")
+        return False, None
+    finally:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
 
 
 async def change_email(c: TelegramClient, new_email: str, mail_client,
@@ -84,8 +114,3 @@ async def terminate(c: TelegramClient):
         await c.log_out()
     except Exception as e:
         log.warning(f"logout: {e}")
-    finally:
-        try:
-            await c.disconnect()
-        except Exception:
-            pass

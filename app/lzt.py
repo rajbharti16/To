@@ -1,4 +1,5 @@
 """LZT Market API client — typed, mapping-corrected, tolerant."""
+import asyncio
 import logging
 
 import httpx
@@ -16,16 +17,30 @@ class LztError(Exception):
 
 
 def _message(payload) -> str:
-    if isinstance(payload, dict):
-        for key in ("message", "error", "errors"):
-            v = payload.get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            if isinstance(v, dict) and v:
-                first = next(iter(v.values()))
-                if isinstance(first, (str, list)):
-                    return str(first)
-    return ""
+    """Dig the human message out of whatever shape the API used."""
+    def dig(node, depth: int = 0) -> str:
+        if depth > 4:
+            return ""
+        if isinstance(node, str):
+            return node.strip()
+        if isinstance(node, dict):
+            for key in ("message", "error", "errors", "detail", "title", "text"):
+                if key in node:
+                    found = dig(node[key], depth + 1)
+                    if found:
+                        return found
+            for value in node.values():
+                found = dig(value, depth + 1)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = dig(value, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    return dig(payload)[:300]
 
 
 class LztClient:
@@ -54,8 +69,7 @@ class LztClient:
             payload = {}
 
         if r.status_code >= 400:
-            msg = _message(payload) or f"HTTP {r.status_code}"
-            raise LztError(msg, r.status_code)
+            raise LztError(_message(payload) or f"HTTP {r.status_code}", r.status_code)
 
         if isinstance(payload, dict) and payload.get("errors"):
             msg = _message(payload)
@@ -130,7 +144,15 @@ class LztClient:
         return data.get("items") or []
 
     async def check_account(self, item_id: int) -> dict:
-        return await self._post(f"/{int(item_id)}/check-account")
+        path = f"/{int(item_id)}/check-account"
+        try:
+            return await self._post(path)
+        except LztError as e:
+            # a bare 403 is usually throttling, not a dead item
+            if e.status == 403 and str(e).startswith("HTTP"):
+                await asyncio.sleep(1.5)
+                return await self._post(path)
+            raise
 
     async def fast_buy(self, item_id: int, price: float, balance_id: int | None = None) -> dict:
         params = {"price": float(price)}

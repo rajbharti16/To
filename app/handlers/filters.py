@@ -70,12 +70,10 @@ def _fmt(key: str, value: float) -> str:
 
 
 async def _replace(bot, chat_id: int, message_id: int, text: str, markup):
-    """Edit the prompt message back into the screen; fall back to a new message."""
     if chat_id and message_id:
         try:
-            await bot.edit_message_text(text=text, chat_id=chat_id,
-                                        message_id=message_id, reply_markup=markup,
-                                        disable_web_page_preview=True)
+            await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id,
+                                        reply_markup=markup, disable_web_page_preview=True)
             return
         except Exception:
             pass
@@ -105,7 +103,8 @@ async def cb_price(cq: CallbackQuery):
 
 @router.callback_query(F.data == "m:spam")
 async def cb_spam(cq: CallbackQuery):
-    await show(cq, "<b>Spam filter</b>", kb.pick("s:spam_mode", ["no", "yes", "any"]))
+    await show(cq, "<b>Spam filter</b>\nany = no server-side spam filter",
+               kb.pick("s:spam_mode", ["no", "yes", "any"]))
     await cq.answer()
 
 
@@ -124,7 +123,7 @@ async def cb_pass(cq: CallbackQuery):
 @router.callback_query(F.data == "m:mailprov")
 async def cb_mailprov(cq: CallbackQuery):
     await show(cq, "<b>Mail source on clean</b>",
-               kb.pick("s:mail_provider", ["auto", "temp", "native"], "m:limits"))
+               kb.pick("s:mail_provider", ["auto", "temp", "native"], BACK_LIMITS := "m:limits"))
     await cq.answer()
 
 
@@ -166,8 +165,8 @@ async def cb_input(cq: CallbackQuery):
     else:
         return await cq.answer("unknown setting", show_alert=True)
 
-    msg = await cq.message.answer(
-        f"<b>{label}</b>\n{hint}\n\n{body}", reply_markup=kb.kb([[("Cancel", "x")]]))
+    msg = await cq.message.answer(f"<b>{label}</b>\n{hint}\n\n{body}",
+                                  reply_markup=kb.kb([[("Cancel", "x")]]))
     _set_pending(cq.from_user.id, key, msg.chat.id, msg.message_id)
     await cq.answer()
 
@@ -204,7 +203,6 @@ async def on_text(m: Message):
     if not hit:
         return
     key = hit["key"]
-
     raw = (m.text or "").strip().replace(" ", "").replace(",", ".")
 
     if key in COUNTRY_KEYS:
@@ -234,8 +232,7 @@ async def on_text(m: Message):
 
     note = ""
     if key in ("session_min_hours", "session_max_hours"):
-        hours = db.num(stored)
-        if 0 < hours < 24:
+        if 0 < db.num(stored) < 24:
             note = ("\n⚠️ below 24h the market filter cannot apply (day granularity) — "
                     "checked locally after check-account")
 

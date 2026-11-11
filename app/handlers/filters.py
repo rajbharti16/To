@@ -1,23 +1,24 @@
+import time
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from app import db, keyboards as kb
 from app.handlers.menu import show
-from app.utils.texts import filters_text
+from app.utils.texts import filters_text, limits_text
 
 router = Router()
 
 PENDING_TTL = 300.0
-PENDING: dict[int, tuple[str, float]] = {}
+PENDING: dict[int, dict] = {}
 
-# key -> (label, hint, lo, hi, decimals)
 NUMERIC = {
     "price_min": ("Min price", "cheapest allowed account price", 0.01, 10_000.0, 2),
     "price_max": ("Max price", "most expensive allowed account price", 0.01, 10_000.0, 2),
-    "session_min_hours": ("Min session age", "0 = any · hours (day granularity above 24)",
-                          0.0, 8_760.0, 1),
-    "session_life_hours": ("Target age", "0 = clean immediately · hours", 0.0, 8_760.0, 1),
+    "session_min_hours": ("Min account age", "0 = any · hours (created time)", 0.0, 87_600.0, 1),
+    "session_max_hours": ("Max account age", "0 = no cap · hours (created time)", 0.0, 87_600.0, 1),
+    "session_life_hours": ("Lifetime after buy", "hours until auto logout", 0.0, 87_600.0, 1),
     "daily_spend_cap": ("Daily spend cap", "0 = unlimited", 0.0, 100_000.0, 2),
     "max_buy_per_cycle": ("Buys per cycle", "1-50", 1.0, 50.0, 0),
     "poll_interval": ("Poll interval", "seconds, 5-3600", 5.0, 3_600.0, 0),
@@ -28,27 +29,71 @@ COUNTRY_KEYS = {
     "deny_countries": "these countries are skipped",
 }
 
+LIMIT_KEYS = {
+    "daily_spend_cap", "max_buy_per_cycle", "poll_interval", "early_clean_if_aged",
+    "terminate_on_expire", "change_mail_on_expire", "mail_provider",
+}
 
-def _set_pending(uid: int, key: str):
-    PENDING[uid] = (key, __import__("time").time())
+
+def screen_for(key: str) -> str:
+    if key == "auto_buy":
+        return "main"
+    return "limits" if key in LIMIT_KEYS else "filters"
 
 
-def _pop_pending(uid: int) -> str | None:
+async def render_screen(cq: CallbackQuery, key: str):
+    screen = screen_for(key)
+    if screen == "main":
+        from app.handlers.menu import render_menu
+        text, markup = await render_menu(cq.from_user.id)
+        return await show(cq, text, markup)
+    s = await db.get_settings(cq.from_user.id)
+    if screen == "limits":
+        return await show(cq, limits_text(s), kb.limits(s))
+    return await show(cq, filters_text(s), kb.filters(s))
+
+
+def _set_pending(uid: int, key: str, chat_id: int = 0, message_id: int = 0):
+    PENDING[uid] = {"key": key, "ts": time.time(),
+                    "chat_id": chat_id, "message_id": message_id}
+
+
+def _pop_pending(uid: int) -> dict | None:
     hit = PENDING.pop(uid, None)
     if not hit:
         return None
-    key, ts = hit
-    return key if __import__("time").time() - ts <= PENDING_TTL else None
+    return hit if time.time() - hit["ts"] <= PENDING_TTL else None
 
 
 def _fmt(key: str, value: float) -> str:
     return f"{value:.{NUMERIC[key][4]}f}".rstrip("0").rstrip(".") or "0"
 
 
+async def _replace(bot, chat_id: int, message_id: int, text: str, markup):
+    """Edit the prompt message back into the screen; fall back to a new message."""
+    if chat_id and message_id:
+        try:
+            await bot.edit_message_text(text=text, chat_id=chat_id,
+                                        message_id=message_id, reply_markup=markup,
+                                        disable_web_page_preview=True)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=markup,
+                           disable_web_page_preview=True)
+
+
 @router.callback_query(F.data == "m:filters")
 async def cb_filters(cq: CallbackQuery):
     s = await db.get_settings(cq.from_user.id)
     await show(cq, filters_text(s), kb.filters(s))
+    await cq.answer()
+
+
+@router.callback_query(F.data == "m:limits")
+async def cb_limits(cq: CallbackQuery):
+    s = await db.get_settings(cq.from_user.id)
+    await show(cq, limits_text(s), kb.limits(s))
     await cq.answer()
 
 
@@ -76,15 +121,22 @@ async def cb_pass(cq: CallbackQuery):
     await cq.answer()
 
 
+@router.callback_query(F.data == "m:mailprov")
+async def cb_mailprov(cq: CallbackQuery):
+    await show(cq, "<b>Mail source on clean</b>",
+               kb.pick("s:mail_provider", ["auto", "temp", "native"], "m:limits"))
+    await cq.answer()
+
+
 @router.callback_query(F.data == "m:sess")
 async def cb_sess(cq: CallbackQuery):
-    await show(cq, "<b>Min session age</b> (0 = any)", kb.floors())
+    await show(cq, "<b>Min account age</b> (0 = any)", kb.floors())
     await cq.answer()
 
 
 @router.callback_query(F.data == "m:life")
 async def cb_life(cq: CallbackQuery):
-    await show(cq, "<b>Target age</b>\nreached target → auto clean", kb.targets())
+    await show(cq, "<b>Lifetime after buy</b>\nreached → auto clean", kb.targets())
     await cq.answer()
 
 
@@ -92,13 +144,11 @@ async def cb_life(cq: CallbackQuery):
 async def cb_set(cq: CallbackQuery):
     parts = cq.data.split(":", 2)
     if len(parts) != 3:
-        return await cq.answer("bad callback", show_alert=False)
+        return await cq.answer("bad callback")
     _, key, value = parts
-    stored = await db.set_setting(cq.from_user.id, key, value)
-    if stored is None:
+    if await db.set_setting(cq.from_user.id, key, value) is None:
         return await cq.answer("unknown setting", show_alert=True)
-    s = await db.get_settings(cq.from_user.id)
-    await show(cq, filters_text(s), kb.filters(s))
+    await render_screen(cq, key)
     await cq.answer("saved")
 
 
@@ -109,45 +159,53 @@ async def cb_input(cq: CallbackQuery):
         hint = COUNTRY_KEYS[key]
         body = ("Send ISO codes, comma separated (e.g. <code>AE,LY,JO</code>)\n"
                 "<code>all</code> = clear · /cancel")
+        label = "Include countries" if key == "countries" else "Exclude countries"
     elif key in NUMERIC:
         label, hint, lo, hi, _ = NUMERIC[key]
         body = f"Send a number ({lo:g}-{hi:g}) · /cancel"
     else:
         return await cq.answer("unknown setting", show_alert=True)
 
-    _set_pending(cq.from_user.id, key)
-    await cq.message.answer(
-        f"<b>{NUMERIC.get(key, (key.replace('_', ' '),))[0]}</b>\n{hint}\n\n{body}",
-        reply_markup=kb.kb([[("Cancel", "x")]]))
+    msg = await cq.message.answer(
+        f"<b>{label}</b>\n{hint}\n\n{body}", reply_markup=kb.kb([[("Cancel", "x")]]))
+    _set_pending(cq.from_user.id, key, msg.chat.id, msg.message_id)
     await cq.answer()
 
 
 @router.callback_query(F.data == "x")
 async def cb_cancel(cq: CallbackQuery):
     PENDING.pop(cq.from_user.id, None)
-    await cq.message.answer("cancelled", reply_markup=kb.back("m:filters"))
-    await cq.answer()
+    from app.handlers.wallet import EXCH
+    EXCH.pop(cq.from_user.id, None)
+    s = await db.get_settings(cq.from_user.id)
+    await show(cq, filters_text(s), kb.filters(s))
+    await cq.answer("cancelled")
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(m: Message):
     PENDING.pop(m.from_user.id, None)
-    await m.answer("cancelled")
+    from app.handlers.wallet import EXCH
+    EXCH.pop(m.from_user.id, None)
+    s = await db.get_settings(m.from_user.id)
+    await m.answer("cancelled", reply_markup=kb.filters(s))
 
 
 @router.message(F.text)
 async def on_text(m: Message):
     if (m.text or "").startswith("/"):
-        return  # keep the pending value alive across commands
-    key = _pop_pending(m.from_user.id)
-    if not key:
-        # amount entry for an active exchange — keeps router order irrelevant
-        from app.handlers import wallet
-        if wallet.has_pending(m.from_user.id):
-            return await wallet.on_amount(m)
         return
 
-    raw = m.text.strip().replace(" ", "").replace(",", ".")
+    from app.handlers import wallet
+    if wallet.has_pending(m.from_user.id):
+        return await wallet.on_amount(m)
+
+    hit = _pop_pending(m.from_user.id)
+    if not hit:
+        return
+    key = hit["key"]
+
+    raw = (m.text or "").strip().replace(" ", "").replace(",", ".")
 
     if key in COUNTRY_KEYS:
         if raw.lower() in ("all", "-", "clear"):
@@ -155,7 +213,7 @@ async def on_text(m: Message):
         else:
             codes = [c.upper() for c in raw.split(",") if len(c) == 2 and c.isalpha()]
             if not codes:
-                _set_pending(m.from_user.id, key)
+                _set_pending(m.from_user.id, key, hit["chat_id"], hit["message_id"])
                 return await m.answer("need ISO codes like AE,LY · /cancel")
             val = ",".join(dict.fromkeys(codes))
         stored = await db.set_setting(m.from_user.id, key, val)
@@ -164,10 +222,10 @@ async def on_text(m: Message):
         try:
             number = float(raw)
         except ValueError:
-            _set_pending(m.from_user.id, key)
+            _set_pending(m.from_user.id, key, hit["chat_id"], hit["message_id"])
             return await m.answer(f"{label}: number expected · /cancel")
         if not lo <= number <= hi:
-            _set_pending(m.from_user.id, key)
+            _set_pending(m.from_user.id, key, hit["chat_id"], hit["message_id"])
             return await m.answer(f"{label}: use {lo:g}-{hi:g} · /cancel")
         stored = await db.set_setting(m.from_user.id, key, _fmt(key, number))
 
@@ -175,15 +233,15 @@ async def on_text(m: Message):
         return await m.answer("unknown setting")
 
     note = ""
-    if key == "session_min_hours":
+    if key in ("session_min_hours", "session_max_hours"):
         hours = db.num(stored)
         if 0 < hours < 24:
             note = ("\n⚠️ below 24h the market filter cannot apply (day granularity) — "
-                    "those items get checked locally after check-account")
-        elif hours:
-            note = f"\n⏱ filter sent to market: {hours / 24:.0f} day(s)+"
+                    "checked locally after check-account")
 
     s = await db.get_settings(m.from_user.id)
-    await m.answer(f"✅ <b>saved</b>: <code>{stored or '-'}</code>{note}",
-                   reply_markup=kb.back("m:filters"))
-    await m.answer(filters_text(s), reply_markup=kb.filters(s))
+    screen = screen_for(key)
+    text = limits_text(s) if screen == "limits" else filters_text(s)
+    markup = kb.limits(s) if screen == "limits" else kb.filters(s)
+    await _replace(m.bot, hit["chat_id"], hit["message_id"],
+                   f"✅ saved <code>{stored or '-'}</code>{note}\n\n{text}", markup)

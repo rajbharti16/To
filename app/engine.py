@@ -18,8 +18,27 @@ log = logging.getLogger("engine")
 
 _BAL_WARNED: dict[int, float] = {}
 WARN_COOLDOWN = 900.0
-CHECK_RETRIES = 3
-CHECK_RETRY_DELAY = 2.0
+
+# strong refs, warna GC pending task destroy kar deta hai ("Task was destroyed")
+_BG: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BG.add(task)
+    task.add_done_callback(_BG.discard)
+    return task
+
+
+async def drain_bg(timeout: float = 5.0):
+    """Shutdown hook: let running login tasks finish instead of killing them."""
+    if not _BG:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*list(_BG), return_exceptions=True), timeout)
+    except asyncio.TimeoutError:
+        log.info(f"shutdown: {len(_BG)} login task(s) still running")
 
 
 async def _notify(bot, tg_id, text):
@@ -44,22 +63,7 @@ async def _search_items(lzt, s: dict) -> list[dict]:
     try:
         return await lzt.search({**s, **q})
     except TypeError:
-        # lzt.search(s) without **kwargs support — fall back to client-side only
         return await lzt.search(s)
-
-
-async def _check_account(lzt, item_id):
-    """check-account with the retry_request loop the docs require."""
-    last = None
-    for attempt in range(CHECK_RETRIES):
-        try:
-            return await lzt.check_account(item_id)
-        except LztError as e:
-            last = e
-            if "retry_request" not in str(e).lower() or attempt == CHECK_RETRIES - 1:
-                raise
-            await asyncio.sleep(CHECK_RETRY_DELAY * (attempt + 1))
-    raise last
 
 
 async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
@@ -79,20 +83,20 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
         return None
 
     try:
-        chk = await _check_account(lzt, item_id)
+        chk = await lzt.check_account(item_id)
     except LztError as e:
         log.info(f"check {item_id}: {e}")
         return None
 
-    # re-run the whole filter against the authoritative check-account payload
+    # authoritative re-check against the full check-account payload
     fresh = dict(item)
     fresh.update({k: v for k, v in (chk.get("item") or {}).items() if v not in (None, "")})
-    ok, why = passes(fresh, s)
+    ok, why = passes(fresh, s, authoritative=True)
     if not ok:
         log.info(f"skip {item_id}: {why}")
         return None
-    if why == "age_unknown" and s["spam_mode"] == "no":
-        log.info(f"note {item_id}: session age unknown, waiting full target")
+    if why == "ok_unknown":
+        log.info(f"note {item_id}: some fields unknown, server filters relied on")
 
     try:
         res = await lzt.fast_buy(item_id, price, balance_id=wallet["balance_id"] or None)
@@ -113,8 +117,7 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict):
         tg_id, item_id, phone, country_of(fresh), price,
         expires_at=expires, target_age_hours=target, age_at_buy_hours=age, note="bought")
 
-    asyncio.create_task(
-        _login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay))
+    _spawn(_login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay))
     return pid
 
 
@@ -130,6 +133,7 @@ async def _login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay):
     when = "cleaning now" if delay <= 0 else f"clean in {delay:.2f}h"
     await _notify(bot, tg_id, f"✅ <b>Bought</b> <code>{phone}</code>\n🕒 {when}")
     await c.disconnect()
+    await asyncio.sleep(0)  # let telethon's loops settle before the task ends
 
 
 async def expire_purchase(bot, lzt, p: dict):
@@ -210,10 +214,10 @@ async def buy_loop(bot, lzt):
                         continue
                     if await buy_one(bot, lzt, tg_id, it, s):
                         bought += 1
-                        if why == "age_unknown":
-                            reasons["age_unknown_bought"] += 1
-                    elif why == "age_unknown":
-                        reasons["age_unknown_skip"] += 1
+                        if why != "ok":
+                            reasons[f"{why}_bought"] += 1
+                    elif why != "ok":
+                        reasons[f"{why}_skip"] += 1
                     if bought >= db.intval(s.get("max_buy_per_cycle"), 2):
                         break
 

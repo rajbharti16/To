@@ -12,10 +12,8 @@ from app.engine import buy_loop, drain_bg, expiry_loop
 from app.handlers import ROUTERS
 from app.handlers.menu import allowed
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
 async def access_mw(handler, event, data):
@@ -23,11 +21,10 @@ async def access_mw(handler, event, data):
     if user is None:
         return await handler(event, data)
     if not allowed(user.id):
-        text = f"Not allowed. id <code>{user.id}</code>"
         if isinstance(event, CallbackQuery):
             await event.answer(f"Not allowed. id {user.id}", show_alert=True)
         elif isinstance(event, Message):
-            await event.answer(text)
+            await event.answer(f"Not allowed. id <code>{user.id}</code>")
         return None
     await db.ensure_user(user.id, user.username or "")
     return await handler(event, data)
@@ -35,26 +32,21 @@ async def access_mw(handler, event, data):
 
 async def main():
     await db.init_db()
-
     for oid in OWNER_IDS:
         await db.ensure_user(oid)
 
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
-
     dp.message.outer_middleware(access_mw)
     dp.callback_query.outer_middleware(access_mw)
 
     for r in ROUTERS:
         dp.include_router(r)
 
-    tasks = [
-        asyncio.create_task(buy_loop(bot, lzt)),
-        asyncio.create_task(expiry_loop(bot, lzt)),
-    ]
+    tasks = [asyncio.create_task(buy_loop(bot, lzt)),
+             asyncio.create_task(expiry_loop(bot, lzt))]
 
     logging.info(f"bot up (mongo db: {MONGO_DB})")
-
     try:
         await dp.start_polling(bot)
     finally:

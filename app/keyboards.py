@@ -12,11 +12,10 @@ BACK_SESSIONS = "m:sessions"
 
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    """Build a markup, skipping empty rows and keeping the given widths."""
     b = InlineKeyboardBuilder()
     widths: list[int] = []
     for row in rows:
-        clean = [(text, data) for text, data in row if text and data]
+        clean = [(t, d) for t, d in row if t and d]
         if not clean:
             continue
         for text, data in clean:
@@ -35,8 +34,6 @@ def _onoff(flag: str, on: str, off: str) -> str:
     return on if flag == "1" else off
 
 
-# ─── main ──────────────────────────────────────────────────────────────────
-
 def main(s: dict) -> InlineKeyboardMarkup:
     return kb([
         [("⏸ Stop" if s["auto_buy"] == "1" else "▶️ Start", "t:auto_buy")],
@@ -45,8 +42,6 @@ def main(s: dict) -> InlineKeyboardMarkup:
         [("Stats", "m:stats")],
     ])
 
-
-# ─── filters ───────────────────────────────────────────────────────────────
 
 def filters(s: dict) -> InlineKeyboardMarkup:
     return kb([
@@ -110,13 +105,8 @@ def floors() -> InlineKeyboardMarkup:
     return pick("s:session_min_hours", ["0", "12", "18", "23", "24"])
 
 
-# ─── sessions ─────────────────────────────────────────────────────────────
-
 def sessions(items: list[dict]) -> InlineKeyboardMarkup:
-    rows: list[list[tuple[str, str]]] = []
-    for p in items:
-        label = p.get("phone") or p["item_id"]
-        rows.append([(f"📱 {label}", f"v:{p['_id']}")])
+    rows = [[(f"📱 {p.get('phone') or p['item_id']}", f"v:{p['_id']}")] for p in items]
     rows.append([("Refresh", BACK_SESSIONS)])
     rows.append([("Back", BACK_MAIN)])
     return kb(rows)
@@ -131,8 +121,6 @@ def session_detail(p: dict) -> InlineKeyboardMarkup:
     ])
 
 
-# ─── wallet ───────────────────────────────────────────────────────────────
-
 def wallet(entries: list[dict]) -> InlineKeyboardMarkup:
     rows = [[("Refresh", BACK_WALLET), ("Payments", "m:payments")]]
     if len(entries) > 1:
@@ -141,11 +129,9 @@ def wallet(entries: list[dict]) -> InlineKeyboardMarkup:
     return kb(rows)
 
 
-def exchange(pool: list[dict], step: str, offset: int = 0, page_size: int = 8) -> InlineKeyboardMarkup:
-    """Paged balance picker; index is absolute so paging never shifts targets."""
-    total = len(pool)
+def exchange(pool: list[dict], step: str, offset: int = 0,
+             page_size: int = 8) -> InlineKeyboardMarkup:
     chunk = pool[offset:offset + page_size]
-
     rows: list[list[tuple[str, str]]] = []
     row: list[tuple[str, str]] = []
     for i, b in enumerate(chunk, start=offset):
@@ -160,7 +146,7 @@ def exchange(pool: list[dict], step: str, offset: int = 0, page_size: int = 8) -
     nav: list[tuple[str, str]] = []
     if offset > 0:
         nav.append(("‹", f"p:{step}:{max(0, offset - page_size)}"))
-    if offset + page_size < total:
+    if offset + page_size < len(pool):
         nav.append(("›", f"p:{step}:{offset + page_size}"))
     if nav:
         rows.append(nav)
@@ -170,18 +156,9 @@ def exchange(pool: list[dict], step: str, offset: int = 0, page_size: int = 8) -
 
 
 def amount(currency: str, available: float) -> InlineKeyboardMarkup:
-    """Quick amounts, capped to what is actually available."""
-    quick: list[tuple[str, str]] = []
-    for v in (10, 50, 100):
-        if v <= available or not quick:
-            quick.append((str(v), f"xa:{v}"))
-    return kb([
-        quick,
-        [("Max", "xa:max"), ("Cancel", "xc")],
-    ])
+    quick = [(str(v), f"xa:{v}") for v in (10, 50, 100) if v <= available] or [("10", "xa:10")]
+    return kb([quick, [("Max", "xa:max"), ("Cancel", "xc")]])
 
-
-# ─── report ───────────────────────────────────────────────────────────────
 
 def report() -> InlineKeyboardMarkup:
     return kb([
@@ -192,7 +169,4 @@ def report() -> InlineKeyboardMarkup:
 
 
 def ledger() -> InlineKeyboardMarkup:
-    return kb([
-        [("Export CSV", "l:csv")],
-        [("Back", BACK_MAIN)],
-    ])
+    return kb([[("Export CSV", "l:csv")], [("Back", BACK_MAIN)]])

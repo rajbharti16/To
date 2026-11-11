@@ -1,4 +1,4 @@
-"""Balance/profile parsing that survives unknown payload shapes."""
+"""Balance parsing that survives unknown payload shapes."""
 from decimal import Decimal, InvalidOperation
 
 SYMBOLS = {"usd": "$", "eur": "€", "rub": "₽", "uah": "₴", "gbp": "£",
@@ -130,25 +130,23 @@ def parse_balances(payload: dict) -> list[dict]:
     return unique
 
 
+def free_of(b: dict) -> float:
+    return max(0.0, float(b.get("amount", 0.0)) - float(b.get("hold", 0.0)))
+
+
 def _rank(b: dict) -> tuple:
     order = {"market": 0, "other": 1, "telegram": 2}
-    return (order.get(b["kind"], 1), -(b["amount"] - b["hold"]))
+    return (order.get(b["kind"], 1), -free_of(b))
 
 
 def spendable(balances: list[dict], currency: str) -> float:
-    return sum(max(0.0, b["amount"] - b["hold"])
-               for b in balances
+    return sum(free_of(b) for b in balances
                if b["usable_for_buy"] and same_currency(b["currency"], currency))
-
-
-def total_any(balances: list[dict], currency: str) -> float:
-    return sum(max(0.0, b["amount"] - b["hold"])
-               for b in balances if same_currency(b["currency"], currency))
 
 
 def pick_for_buy(balances: list[dict], currency: str, price: float) -> dict | None:
     """Best balance covering `price`. Market first, telegram never."""
     cands = [b for b in sorted(balances, key=_rank)
              if b["usable_for_buy"] and same_currency(b["currency"], currency)
-             and (b["amount"] - b["hold"]) >= price]
+             and free_of(b) >= price]
     return cands[0] if cands else None

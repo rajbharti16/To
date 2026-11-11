@@ -40,8 +40,6 @@ def _oid(pid):
         return None
 
 
-# ---------- value coercion (public: engine/UI reuse these) ----------
-
 def num(value, default: float = 0.0) -> float:
     try:
         return float(str(value).replace(",", ".").strip())
@@ -155,8 +153,6 @@ def normalize_settings(raw: dict) -> tuple[dict, dict]:
     return clean, fixes
 
 
-# ---------- lifecycle ----------
-
 async def init_db():
     global _client, _db
     _client = AsyncMongoClient(MONGO_URI)
@@ -179,8 +175,6 @@ async def ensure_user(tg_id: int, username: str = ""):
     await _db.settings.update_one(
         {"tg_id": tg_id}, {"$setOnInsert": {**clean, "tg_id": tg_id}}, upsert=True)
 
-
-# ---------- settings ----------
 
 async def get_settings(tg_id: int) -> dict:
     doc = await _db.settings.find_one({"tg_id": tg_id})
@@ -211,8 +205,6 @@ async def set_setting(tg_id: int, key: str, value) -> str | None:
 async def all_owners() -> list[dict]:
     return await _db.users.find({}, {"_id": 1}).to_list(None)
 
-
-# ---------- spending / purchases ----------
 
 async def spent_today(tg_id: int) -> float:
     cursor = await _db.purchases.aggregate([

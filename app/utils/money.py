@@ -15,6 +15,10 @@ AMT_KEYS = ("balance", "amount", "value", "sum", "available", "free")
 HOLD_KEYS = ("hold", "held", "frozen", "pending", "locked")
 ID_KEYS = ("balance_id", "id", "wallet_id", "balanceid")
 
+# only these describe what a balance *is* — avoids "tg" matching inside usernames
+_ID_FIELDS = ("balance_type", "type", "kind", "slug", "title", "name", "label",
+              "description", "payment_method")
+
 
 def canon(currency: str) -> str:
     c = (currency or "usd").strip().lower()
@@ -65,7 +69,10 @@ def _pick(d: dict, keys) -> tuple[str | None, object]:
 
 
 def _kind(d: dict) -> str:
-    raw = " ".join(str(v).lower() for v in d.values() if isinstance(v, (str, int, float)))
+    """Classify by identity fields only; everything else is generic."""
+    raw = " ".join(str(d.get(k)).lower() for k in _ID_FIELDS if d.get(k) not in (None, ""))
+    if not raw:
+        raw = " ".join(str(v).lower() for v in d.values() if isinstance(v, str))
     if any(m in raw for m in TELEGRAM_MARKERS):
         return "telegram"
     if any(m in raw for m in MARKET_MARKERS):
@@ -87,7 +94,7 @@ def _entry(d: dict, currency: str) -> dict:
     _, bid = _pick(d, ID_KEYS)
     return {
         "balance_id": int(_num(bid, 0) or 0),
-        "currency": currency.lower(),
+        "currency": (currency or "usd").lower(),
         "amount": _num(_pick(d, AMT_KEYS)[1], 0.0),
         "hold": _num(hold, 0.0),
         "kind": kind,
@@ -136,7 +143,8 @@ def free_of(b: dict) -> float:
 
 def _rank(b: dict) -> tuple:
     order = {"market": 0, "other": 1, "telegram": 2}
-    return (order.get(b["kind"], 1), -free_of(b))
+    has_id = 0 if b.get("balance_id") else 1
+    return (order.get(b["kind"], 1), has_id, -free_of(b))
 
 
 def spendable(balances: list[dict], currency: str) -> float:
@@ -144,8 +152,16 @@ def spendable(balances: list[dict], currency: str) -> float:
                if b["usable_for_buy"] and same_currency(b["currency"], currency))
 
 
+def total_of(payload: dict, currency: str) -> float:
+    """Real free money straight from the user object."""
+    user = parse_user(payload)
+    if same_currency(user["currency"], currency):
+        return max(0.0, user["balance"] - user["hold"])
+    return 0.0
+
+
 def pick_for_buy(balances: list[dict], currency: str, price: float) -> dict | None:
-    """Best balance covering `price`. Market first, telegram never."""
+    """Best balance covering `price`. Real ids and market funds first."""
     cands = [b for b in sorted(balances, key=_rank)
              if b["usable_for_buy"] and same_currency(b["currency"], currency)
              and free_of(b) >= price]

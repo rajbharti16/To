@@ -103,7 +103,10 @@ async def cb_price(cq: CallbackQuery):
 
 @router.callback_query(F.data == "m:spam")
 async def cb_spam(cq: CallbackQuery):
-    await show(cq, "<b>Spam filter</b>\nany = no server-side spam filter",
+    await show(cq, "<b>Spam filter</b>\n"
+                   "<i>no</i> — server filters, item flag only noted\n"
+                   "<i>yes</i> — only spam-blocked accounts\n"
+                   "<i>any</i> — no server filter, local check enforces",
                kb.pick("s:spam_mode", ["no", "yes", "any"]))
     await cq.answer()
 
@@ -123,7 +126,7 @@ async def cb_pass(cq: CallbackQuery):
 @router.callback_query(F.data == "m:mailprov")
 async def cb_mailprov(cq: CallbackQuery):
     await show(cq, "<b>Mail source on clean</b>",
-               kb.pick("s:mail_provider", ["auto", "temp", "native"], BACK_LIMITS := "m:limits"))
+               kb.pick("s:mail_provider", ["auto", "temp", "native"], "m:limits"))
     await cq.answer()
 
 

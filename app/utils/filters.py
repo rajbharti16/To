@@ -2,6 +2,9 @@
 
 Age comes from the real account creation time first, then session-age fields,
 then the title. Anything unreadable stays "unknown" and never rejects.
+
+Spam is server-authoritative: the search query already carries spam=no/yes, so
+the item flag is only enforced locally when the server was told to ignore spam.
 """
 from __future__ import annotations
 
@@ -256,14 +259,20 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
 
     unknown = False
 
+    # Server-authoritative: the query already carried spam=no/yes, so the item
+    # flag is only enforced when the server was told to ignore spam.
     spam = spam_state(item)
     mode = s.get("spam_mode", "no")
-    if spam is None:
-        unknown = True
-    elif mode == "yes" and spam is False:
-        return False, "spam_missing"
-    elif mode == "no" and spam is True:
-        return False, "spam"
+    if mode == "any":
+        if spam is None:
+            unknown = True
+        elif spam is True and s.get("verify_spam", "1") == "1":
+            return False, "spam"
+    elif mode == "yes":
+        if spam is None:
+            unknown = True
+        elif spam is False:
+            return False, "spam_missing"
 
     mail = mail_state(item)
     mode = s.get("mail_mode", "any")

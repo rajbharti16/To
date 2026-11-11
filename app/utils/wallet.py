@@ -1,18 +1,18 @@
 """Balance snapshot: authoritative market total + spendable entries.
 
 `balances()` alone is not enough — the real money lives on the user object, and
-the per-balance list can be empty or hold only the TG wallet. The total is
-therefore read independently and the list only refines it.
+the per-balance list can be empty or hold only the TG wallet. The total is read
+independently and the list only refines it, never shrinks it.
 """
 import logging
 
-from app.utils.money import free_of, spendable, total_of
+from app.utils.money import free_of, same_currency, spendable, total_of
 
 log = logging.getLogger("wallet")
 
 
-def _coerce(entry) -> list[dict]:
-    return [b for b in (entry or []) if isinstance(b, dict)]
+def _coerce(entries) -> list[dict]:
+    return [b for b in (entries or []) if isinstance(b, dict)]
 
 
 async def snapshot(lzt, currency: str) -> dict:
@@ -27,36 +27,37 @@ async def snapshot(lzt, currency: str) -> dict:
         snap["error"] = str(e)
         log.info(f"balances: {e}")
 
-    spend = spendable(entries, currency)
-
-    total = spend
+    total = 0.0
     try:
-        total = max(total, float(await lzt.balance_total(currency)))
+        total = float(await lzt.balance_total(currency))
     except AttributeError:
         try:
-            total = max(total, total_of(await lzt.profile(), currency))
+            total = total_of(await lzt.profile(), currency)
         except Exception as e:
-            if not snap["error"]:
-                snap["error"] = str(e)
+            snap["error"] = snap["error"] or str(e)
     except Exception as e:
-        if not snap["error"]:
-            snap["error"] = str(e)
+        snap["error"] = snap["error"] or str(e)
 
-    if total > 0 and not any(b["usable_for_buy"] and free_of(b) >= total for b in entries):
-        if not entries:
-            entries = [{
+    usable = [b for b in entries
+              if b["usable_for_buy"] and same_currency(b["currency"], currency)]
+    total = max(total, sum(free_of(b) for b in usable))
+
+    # money exists but nothing is chargeable → fall back to the default balance
+    if total > 0 and not any(free_of(b) >= total for b in usable):
+        if not usable:
+            entries.append({
                 "balance_id": 0, "currency": currency, "amount": total, "hold": 0.0,
                 "kind": "market", "label": "Market balance", "usable_for_buy": True,
-            }]
-            snap["note"] = "no balance ids exposed"
+            })
+            snap["note"] = "default balance (no usable ids)"
 
-    others = {b["currency"] for b in entries if b["currency"]}
+    others = {b["currency"] for b in entries if b.get("currency")}
     if others and currency not in others:
         snap["note"] = f"balances in {', '.join(sorted(others))}, settings say {currency}"
 
     snap["entries"] = entries
-    snap["spendable"] = spend
-    snap["total"] = max(total, spend)
+    snap["spendable"] = spendable(entries, currency)   # after the fallback
+    snap["total"] = max(total, snap["spendable"])
     return snap
 
 

@@ -7,6 +7,7 @@ from app.config import OWNER_IDS
 from app.deps import lzt
 from app.utils import wallet as wallet_view
 from app.utils.texts import menu_text
+from app.utils.timeutil import fmt_dt
 
 router = Router()
 
@@ -29,6 +30,21 @@ async def show(cq: CallbackQuery, text: str, markup):
     await cq.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
 
 
+async def _last_line(tg_id: int) -> str:
+    rows = await db.recent_reports(tg_id, 1)
+    if not rows:
+        return ""
+    r = rows[0]
+    stamp = fmt_dt(r.get("ts"))
+    if r.get("error"):
+        return f"last {stamp}: ⚠️ {r['error'][:70]}"
+    if r.get("note"):
+        return f"last {stamp}: {r['note'][:70]}"
+    if r.get("scanned"):
+        return f"last {stamp}: scan {r['scanned']} · buy {r.get('bought', 0)}"
+    return ""
+
+
 async def render_menu(tg_id: int) -> tuple[str, object]:
     s = await db.get_settings(tg_id)
     snap = await wallet_view.snapshot(lzt, s["currency"])
@@ -39,10 +55,16 @@ async def render_menu(tg_id: int) -> tuple[str, object]:
 
     note = snap["note"]
     if not snap["error"] and snap["spendable"] < db.num(s.get("price_min")):
-        hint = f"below min price {s['price_min']}"
+        hint = f"spendable below min price {s['price_min']}"
         note = f"{note} · {hint}" if note else hint
+    if snap["error"]:
+        note = f"{note} · {snap['error'][:60]}" if note else snap["error"][:60]
 
     queued = await db.queue_count(tg_id)
+    last = await _last_line(tg_id)
+    if last:
+        note = f"{note} · {last}" if note else last
+
     return menu_text(s, profile, snap["total"], snap["spendable"], queued, note), kb.main(s)
 
 

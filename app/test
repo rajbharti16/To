@@ -1,1 +1,95 @@
  
+app/session_manager.py
+
+
+"""Telethon: login via LZT code, change mail, terminate session."""
+import asyncio
+import logging
+import re
+
+from telethon import TelegramClient, functions
+from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
+
+from app.config import API_HASH, API_ID, CODE_TIMEOUT
+
+log = logging.getLogger("session")
+
+
+def _proxy(cfg: str):
+    if not cfg:
+        return None
+    m = re.match(r"(socks5|socks4|http)://(?:([^:@]+):([^@]+)@)?([^:]+):(\d+)", cfg)
+    if not m:
+        return None
+    import socks
+    proto, user, pwd, host, port = m.groups()
+    t = {"socks5": socks.SOCKS5, "socks4": socks.SOCKS4, "http": socks.HTTP}[proto]
+    return (t, host, int(port), True, user, pwd)
+
+
+def client(session_string: str = "", proxy_cfg: str = ""):
+    return TelegramClient(StringSession(session_string), API_ID, API_HASH,
+                          proxy=_proxy(proxy_cfg), connection_retries=3, timeout=30)
+
+
+async def login_with_lzt(phone: str, password: str, item_id: int, lzt, proxy_cfg: str = ""):
+    c = client("", proxy_cfg)
+    await c.connect()
+    sent = await c.send_code_request(phone)
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    code = None
+    while loop.time() - start < CODE_TIMEOUT:
+        got, _ = await lzt.telegram_login_code(item_id)
+        if got and len(got) >= 4:
+            code = got
+            break
+        await asyncio.sleep(5)
+    if not code:
+        await c.disconnect()
+        raise RuntimeError("LZT login code not received")
+
+    try:
+        await c.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
+    except SessionPasswordNeededError:
+        if not password:
+            raise RuntimeError("2FA required but no password on item")
+        await c.sign_in(password=password)
+
+    if not await c.is_user_authorized():
+        raise RuntimeError("not authorized after sign_in")
+
+    me = await c.get_me()
+    return c, c.session.save(), me.id
+
+
+async def change_email(c: TelegramClient, new_email: str, mail_client,
+                       code_timeout: int = CODE_TIMEOUT) -> str:
+    await c(functions.account.SendVerifyEmailCodeRequest(email=new_email))
+    code = await mail_client.fetch_verification_code(new_email, timeout=code_timeout)
+    await c(functions.account.VerifyEmailRequest(code=code))
+    return code
+
+
+async def terminate(c: TelegramClient):
+    try:
+        auths = await c(functions.account.GetAuthorizationsRequest())
+        for a in auths.authorizations:
+            if not a.current:
+                try:
+                    await c(functions.account.ResetAuthorizationRequest(hash=a.hash))
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning(f"reset auths: {e}")
+    try:
+        await c.log_out()
+    except Exception as e:
+        log.warning(f"logout: {e}")
+    finally:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass

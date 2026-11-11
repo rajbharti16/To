@@ -27,20 +27,17 @@ MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "accstore")
 
 LZT_BASE: str = "https://api.lzt.market"
-HTTP_TIMEOUT: int = 300
-SEARCH_DELAY: float = 3.0
+HTTP_TIMEOUT: int = 40
 TICK: float = 15.0
 CODE_TIMEOUT: int = 180
 
 CACHE_TTL: float = 20.0
 PAYMENTS_PAGE: int = 10
 
-# expiry worker
 EXPIRY_RETRY: int = 8
 EXPIRY_RETRY_DELAY: int = 300
 EXPIRY_LOGIN_GRACE: int = 3600
 
-# reporting
 REPORT_KEEP_HOURS: int = 72
 
 QUICK_COUNTRIES = ["AE", "LY", "JO", "EG", "IQ", "SA", "KW", "QA", "SD", "YE", "MA", "DZ"]

@@ -143,6 +143,7 @@ def normalize_setting(key: str, value) -> str | None:
 
 
 def normalize_settings(raw: dict) -> tuple[dict, dict]:
+    """(clean, fixes) — fixes holds only keys that had to be repaired."""
     clean, fixes = {}, {}
     for key, default in DEFAULTS.items():
         norm = NORMALIZERS[key](raw.get(key, default))
@@ -199,6 +200,7 @@ async def get_settings(tg_id: int) -> dict:
 
 
 async def set_setting(tg_id: int, key: str, value) -> str | None:
+    """Stores the normalized value. Returns it, or None for an unknown key."""
     norm = normalize_setting(key, value)
     if norm is None:
         return None
@@ -223,8 +225,8 @@ async def spent_today(tg_id: int) -> float:
 
 async def add_purchase(tg_id, item_id, phone, country, price, mail="", mail_password="",
                        session_string="", expires_at=0, target_age_hours=24.0,
-                       age_at_buy_hours=0.0, account_created_ts=0, status="active",
-                       note="") -> str:
+                       age_at_buy_hours=0.0, account_created_ts=0, spam_flag=False,
+                       status="active", note="") -> str:
     now = _now()
     pid = (await _db.purchases.insert_one({
         "tg_id": tg_id, "item_id": item_id, "phone": phone, "country": country,
@@ -234,6 +236,7 @@ async def add_purchase(tg_id, item_id, phone, country, price, mail="", mail_pass
         "target_age_hours": float(target_age_hours),
         "age_at_buy_hours": float(age_at_buy_hours),
         "account_created_ts": int(account_created_ts or 0),
+        "spam_flag": bool(spam_flag),
         "expiry_tries": 0, "session_state": "pending", "checked_at": 0,
         "closed_at": 0, "note": note,
     })).inserted_id
@@ -300,7 +303,8 @@ async def close_purchase(pid, status: str, note: str = "", new_mail: str = ""):
         upd["mail"] = new_mail
     await _db.purchases.update_one({"_id": oid}, {"$set": upd})
     await _db.ledger.update_one(
-        {"purchase_id": oid}, {"$set": {"status": status, "closed_at": _now(), "extra": note}})
+        {"purchase_id": oid},
+        {"$set": {"status": status, "closed_at": _now(), "extra": note}})
 
 
 async def mark_sold(pid, sell_price: float) -> bool:
@@ -347,8 +351,10 @@ async def save_report(tg_id: int, *, scanned: int = 0, bought: int = 0,
         "skipped": int(sum((reasons or {}).values())), "reasons": reasons or {},
         "note": note[:200], "error": error[:300],
     })
-    await _db.reports.delete_many({"tg_id": tg_id, "ts": {"$lt": now - REPORT_KEEP_HOURS * 3600}})
+    await _db.reports.delete_many(
+        {"tg_id": tg_id, "ts": {"$lt": now - REPORT_KEEP_HOURS * 3600}})
 
 
 async def recent_reports(tg_id: int, limit: int = 10) -> list[dict]:
-    return await _db.reports.find({"tg_id": tg_id}).sort("ts", DESCENDING).limit(limit).to_list(None)
+    return await _db.reports.find({"tg_id": tg_id}) \
+        .sort("ts", DESCENDING).limit(limit).to_list(None)

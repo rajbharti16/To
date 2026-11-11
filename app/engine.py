@@ -12,7 +12,7 @@ from app.session_manager import change_email, client, login_with_lzt, terminate
 from app.utils import wallet as wallet_view
 from app.utils.filters import (
     account_created_ts, age_hours_of, clean_delay_hours, country_of, passes, phone_of,
-    search_query,
+    search_query, spam_state,
 )
 from app.utils.money import fmt_money, pick_for_buy
 
@@ -95,7 +95,12 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> tupl
     if not ok:
         log.info(f"skip {item_id}: {why}")
         return False, why
-    if why == "ok_unknown":
+
+    soft = ""
+    if why == "ok" and s.get("spam_mode") == "no" and spam_state(fresh) is True:
+        soft = "spam_flag"
+        log.info(f"note {item_id}: spam flag set but server filter says clean")
+    elif why == "ok_unknown":
         log.info(f"note {item_id}: fields unknown, relying on server filters")
 
     wallet = pick_for_buy(snap["entries"], currency, price)
@@ -130,7 +135,7 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> tupl
         account_created_ts=created, note="bought")
 
     _spawn(_login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay))
-    return True, "bought"
+    return True, (soft or "bought")
 
 
 async def _login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay):
@@ -273,6 +278,8 @@ async def _cycle(bot, lzt, tg_id: int, s: dict):
         done, why = await buy_one(bot, lzt, tg_id, it, s, snap)
         if done:
             bought += 1
+            if why != "bought":
+                reasons[why] += 1
         else:
             reasons[why] += 1
         if bought >= max_buys:

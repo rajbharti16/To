@@ -1,10 +1,11 @@
-"""Buy loop + expiry worker + cycle reporting."""
 import asyncio
 import logging
 import time
 from collections import Counter
 
-from app import db
+from aiogram.types import BufferedInputFile
+
+from app import db, keyboards as kb
 from app.config import EXPIRY_LOGIN_GRACE, EXPIRY_RETRY, EXPIRY_RETRY_DELAY, TICK
 from app.lzt import LztError
 from app.mail_engine import IMAPMailClient, TempMailClient
@@ -15,6 +16,7 @@ from app.utils.filters import (
     search_query, spam_state,
 )
 from app.utils.money import fmt_money, pick_for_buy
+from app.utils.texts import bought_text, session_file
 
 log = logging.getLogger("engine")
 
@@ -46,6 +48,28 @@ async def _notify(bot, tg_id, text):
         await bot.send_message(tg_id, text)
     except Exception:
         pass
+
+
+async def _notify_card(bot, tg_id, p: dict, stage: str):
+    """Purchase card. The ready stage also ships the session as a file."""
+    text = bought_text(p, stage)
+    markup = kb.bought(p) if p.get("_id") else None
+    try:
+        await bot.send_message(tg_id, text, reply_markup=markup,
+                               disable_web_page_preview=True)
+    except Exception:
+        try:
+            await bot.send_message(tg_id, text)
+        except Exception:
+            return
+
+    if stage == "ready" and p.get("session_string"):
+        name = (p.get("phone") or str(p.get("item_id"))).lstrip("+") or "session"
+        try:
+            await bot.send_document(
+                tg_id, BufferedInputFile(session_file(p).encode(), filename=f"{name}.py"))
+        except Exception:
+            pass
 
 
 async def _balance_warn(bot, tg_id, text):
@@ -132,7 +156,12 @@ async def buy_one(bot, lzt, tg_id: int, item: dict, s: dict, snap: dict) -> tupl
     pid = await db.add_purchase(
         tg_id, item_id, phone, country_of(fresh), price,
         expires_at=expires, target_age_hours=target, age_at_buy_hours=age,
-        account_created_ts=created, note="bought")
+        account_created_ts=created, spam_flag=(soft == "spam_flag"), note="bought")
+
+    purchase = await db.get_purchase(pid)
+    if purchase:
+        purchase["password"] = password
+        await _notify_card(bot, tg_id, purchase, "bought")
 
     _spawn(_login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay))
     return True, (soft or "bought")
@@ -143,12 +172,18 @@ async def _login_task(bot, lzt, tg_id, pid, item_id, phone, password, s, delay):
         c, session_str, _uid = await login_with_lzt(phone, password, item_id, lzt, s["proxy"])
     except Exception as e:
         await db.close_purchase(pid, "login_failed", str(e)[:200])
-        await _notify(bot, tg_id, f"⚠️ <b>Login failed</b>\n<code>{phone}</code>\n<code>{e}</code>")
+        p = await db.get_purchase(pid)
+        if p:
+            p["password"] = password
+            await _notify_card(bot, tg_id, p, "failed")
         return
 
     await db.set_session(pid, session_str)
-    when = "cleaning now" if delay <= 0 else f"clean in {delay:.2f}h"
-    await _notify(bot, tg_id, f"✅ <b>Bought</b> <code>{phone}</code>\n🕒 {when}")
+    p = await db.get_purchase(pid)
+    if p:
+        p["password"] = password
+        await _notify_card(bot, tg_id, p, "ready")
+
     try:
         await c.disconnect()
     except Exception:

@@ -16,7 +16,6 @@ ID_KEYS = ("balance_id", "id", "wallet_id", "balanceid")
 _ID_FIELDS = ("balance_type", "type", "kind", "slug", "title", "name", "label",
               "description", "payment_method")
 
-_WALLET_TOKENS = {"wallet", "tg", "telegram", "tgwallet"}
 _MARKET_TOKENS = {"market", "main", "trade", "trading", "spend"}
 
 
@@ -73,7 +72,7 @@ def _tokens(text: str) -> set[str]:
 
 
 def _kind(d: dict) -> str:
-    """Only identity fields decide. No identity info → treat as usable."""
+    """Only identity fields decide; no identity info → usable."""
     raw = " ".join(str(d.get(k)) for k in _ID_FIELDS if d.get(k) not in (None, ""))
     if not raw.strip():
         return "other"
@@ -149,8 +148,7 @@ def free_of(b: dict) -> float:
 
 def _rank(b: dict) -> tuple:
     order = {"market": 0, "other": 1, "telegram": 2}
-    has_id = 0 if b.get("balance_id") else 1
-    return (order.get(b["kind"], 1), has_id, -free_of(b))
+    return (order.get(b["kind"], 1), 0 if b.get("balance_id") else 1, -free_of(b))
 
 
 def spendable(balances: list[dict], currency: str) -> float:
@@ -166,7 +164,6 @@ def total_of(payload: dict, currency: str) -> float:
 
 
 def pick_for_buy(balances: list[dict], currency: str, price: float) -> dict | None:
-    """Best balance covering `price`. Real ids and market funds first."""
     cands = [b for b in sorted(balances, key=_rank)
              if b["usable_for_buy"] and same_currency(b["currency"], currency)
              and free_of(b) >= price]

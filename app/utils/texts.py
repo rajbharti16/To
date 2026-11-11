@@ -1,4 +1,6 @@
 """Message formatting — $ only, no TG wallet, no prices on buttons."""
+import html
+
 from app.config import API_HASH, API_ID
 from app.utils.money import fmt_money
 from app.utils.timeutil import fmt_age, fmt_dt, fmt_left
@@ -78,15 +80,57 @@ def wallet_text(snap: dict) -> str:
     return body
 
 
+def account_card(p: dict) -> str:
+    """Identity block shared by every purchase message."""
+    created = p.get("account_created_ts") or 0
+    lines = [
+        f"📱 <b>{p.get('phone') or '—'}</b>",
+        f"🌍 <b>{p.get('country') or '??'}</b> · item <code>{p['item_id']}</code>",
+        f"💵 {fmt_money(p.get('price') or 0.0)} · bought {fmt_dt(p.get('started_at'))}",
+        f"🗓 created {fmt_dt(created) if created else 'unknown'}"
+        f" · age {fmt_age(p.get('age_at_buy_hours'))}",
+    ]
+    if p.get("password"):
+        lines.append(f"🔑 <code>{html.escape(str(p['password']))}</code>")
+    if p.get("mail"):
+        lines.append(f"📧 {html.escape(str(p['mail']))}")
+    if p.get("spam_flag"):
+        lines.append("🚫 spam flag set")
+    if p.get("expires_at"):
+        lines.append(f"⏳ closes {fmt_dt(p['expires_at'])}"
+                     f" · {fmt_left(p['expires_at'])}")
+    return "\n".join(lines)
+
+
+def session_block(p: dict) -> str:
+    session = p.get("session_string") or ""
+    if not session:
+        return "🔌 session: <i>pending</i>"
+    return f"🔐 <b>Telethon session</b>\n<code>{html.escape(session)}</code>"
+
+
+def bought_text(p: dict, stage: str = "ready") -> str:
+    head = {
+        "bought": "🛒 <b>Bought</b> — logging in…",
+        "ready": "✅ <b>Session ready</b>",
+        "failed": "⚠️ <b>Login failed</b>",
+    }.get(stage, "🛒 <b>Bought</b>")
+    body = f"{head}\n━━━━━━━━━━━━━━━━━━━━━━\n{account_card(p)}"
+    if stage == "ready":
+        body += f"\n\n{session_block(p)}"
+    if p.get("note"):
+        body += f"\n📝 {html.escape(str(p['note'])[:150])}"
+    return body
+
+
 def session_detail(p: dict, checked: str = "") -> str:
     created = p.get("account_created_ts") or 0
-    age = p.get("age_at_buy_hours") or 0.0
     body = (
         f"📱 <b>{p.get('phone') or '—'}</b>\n"
         f"item <code>{p['item_id']}</code> · {p.get('country') or '??'}\n"
         f"created {fmt_dt(created) if created else 'unknown'}"
-        f" · age {fmt_age(age)} at buy\n"
-        f"bought {fmt_dt(p.get('started_at'))} for {fmt_money(p['price'])}\n"
+        f" · age {fmt_age(p.get('age_at_buy_hours'))} at buy\n"
+        f"bought {fmt_dt(p.get('started_at'))} for {fmt_money(p.get('price') or 0.0)}\n"
         f"lifetime {p.get('target_age_hours', 24):g}h"
         f" · closes {fmt_dt(p.get('expires_at'))}\n"
         f"⏳ {fmt_left(p.get('expires_at'))}\n"
@@ -107,6 +151,7 @@ def session_file(p: dict) -> str:
         f"# AccStore session\n"
         f"phone = {p.get('phone')}\n"
         f"item_id = {p['item_id']}\n"
+        f"country = {p.get('country') or ''}\n"
         f"mail = {p.get('mail') or ''}\n"
         f"account_created = {fmt_dt(created) if created else 'unknown'}\n"
         f"age_at_buy_hours = {p.get('age_at_buy_hours', 0)}\n"

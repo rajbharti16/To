@@ -21,7 +21,7 @@ async def cb_stats(cq: CallbackQuery):
 async def cb_ledger(cq: CallbackQuery):
     rows = await db.ledger_rows(cq.from_user.id)
     if not rows:
-        return await show(cq, "📊 <b>Ledger empty</b>", kb.back())
+        return await show(cq, "ledger empty", kb.back())
     buf = io.StringIO()
     buf.write("purchase_id,item_id,buy,sell,status,created,closed\n")
     for r in rows:

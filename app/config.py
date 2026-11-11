@@ -8,11 +8,13 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+
 def _int(v, d=0):
     try:
         return int(v)
     except (TypeError, ValueError):
         return d
+
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 LZT_TOKEN: str = os.getenv("LZT_TOKEN", "").strip()
@@ -30,8 +32,15 @@ SEARCH_DELAY: float = 3.0
 TICK: float = 15.0
 CODE_TIMEOUT: int = 180
 
-# live API cache — GET endpoints are 300/min, keep UI snappy without spamming
 CACHE_TTL: float = 20.0
 PAYMENTS_PAGE: int = 10
+
+# expiry worker
+EXPIRY_RETRY: int = 8
+EXPIRY_RETRY_DELAY: int = 300
+EXPIRY_LOGIN_GRACE: int = 3600
+
+# reporting
+REPORT_KEEP_HOURS: int = 72
 
 QUICK_COUNTRIES = ["AE", "LY", "JO", "EG", "IQ", "SA", "KW", "QA", "SD", "YE", "MA", "DZ"]

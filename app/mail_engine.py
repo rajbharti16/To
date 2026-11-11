@@ -1,12 +1,8 @@
-"""
-Mail engine: permutations, temp mail (Mail.tm → Tempmail.plus fallback), IMAP fetcher.
-"""
+"""Mail engine: temp mail (Mail.tm → Tempmail.plus fallback) + IMAP fetcher."""
 import asyncio
 import email as emaillib
 import email.header
-import heapq
 import imaplib
-import itertools
 import json
 import logging
 import os
@@ -20,90 +16,6 @@ import urllib.request
 from app.config import DATA_DIR
 
 VAULT = os.path.join(DATA_DIR, "temp_mail_vault.json")
-
-
-class PermutationGenerator:
-    GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
-
-    def __init__(self, base_email: str):
-        self.base_email = base_email.strip()
-        parts = self.base_email.split("@")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid email format: {base_email}")
-        self.local_part, self.domain = parts[0], parts[1].lower()
-        self.is_gmail = self.domain in self.GMAIL_DOMAINS
-        clean = self.local_part.replace(".", "") if self.is_gmail else self.local_part
-        letters = sum(1 for c in clean if c.isalpha())
-        dot_combos = 2 ** (len(clean) - 1) if (self.is_gmail and len(clean) > 1) else 1
-        self._total = (2 ** letters) * dot_combos
-        self._cache: list[str] = []
-        self._gen = self._build_stream()
-        self._exhausted = False
-
-    def _build_stream(self):
-        clean = self.local_part.replace(".", "") if self.is_gmail else self.local_part
-        slots = len(clean) - 1
-
-        def choices_at(dot_set):
-            out = []
-            for i, ch in enumerate(clean):
-                c = [ch.upper(), ch.lower()] if ch.isalpha() else [ch]
-                out.append([x + "." for x in c] if i in dot_set else c)
-            return out
-
-        if not self.is_gmail or slots <= 0:
-            for combo in itertools.product(*choices_at(set())):
-                yield f"{''.join(combo)}@{self.domain}"
-            return
-
-        for k in range(slots + 1):
-            if k == 0:
-                for combo in itertools.product(*choices_at(set())):
-                    yield f"{''.join(combo)}@{self.domain}"
-                continue
-            gens = []
-            for dots in itertools.combinations(range(slots), k):
-                ds = set(dots)
-                gens.append(
-                    (f"{''.join(c)}@{self.domain}" for c in itertools.product(*choices_at(ds)))
-                )
-            yield from heapq.merge(*gens)
-
-    def _ensure(self, n):
-        while len(self._cache) < n and not self._exhausted:
-            try:
-                self._cache.append(next(self._gen))
-            except StopIteration:
-                self._exhausted = True
-
-    @property
-    def total_permutations(self) -> int:
-        return self._total
-
-    def get_permutation(self, index: int) -> str:
-        if not 0 <= index < self._total:
-            raise IndexError(f"index {index} / max {self._total}")
-        self._ensure(index + 1)
-        return self._cache[index]
-
-    def get_next_unused(self, used: list) -> str:
-        used_set = set(used)
-        for p in self._cache:
-            if p not in used_set:
-                return p
-        while not self._exhausted:
-            try:
-                item = next(self._gen)
-            except StopIteration:
-                self._exhausted = True
-                break
-            self._cache.append(item)
-            if item not in used_set:
-                return item
-        raise ValueError("All permutations exhausted")
-
-    def remaining_count(self, used: list) -> int:
-        return max(0, self._total - len(set(used)))
 
 
 def extract_telegram_code(text: str, expected_length: int = None):
@@ -146,7 +58,7 @@ class TempMailClient:
         self._provider = None
 
     def _http(self, url, data=None, headers=None, method=None):
-        hdrs = {"User-Agent": "Mozilla/5.0 (AccStore/1.0)", "Content-Type": "application/json"}
+        hdrs = {"User-Agent": "Mozilla/5.0 (AccStore/2.0)", "Content-Type": "application/json"}
         hdrs.update(headers or {})
         body = json.dumps(data).encode() if isinstance(data, dict) else data
         req = urllib.request.Request(url, data=body, headers=hdrs, method=method)

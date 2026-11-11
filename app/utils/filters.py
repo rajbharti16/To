@@ -1,14 +1,23 @@
-"""Pure filter logic — no IO, unit-testable."""
+"""Pure filter logic — no IO, unit-testable.
+
+Two phases:
+  passes(item, s)                      -> pre-check, search result fields only
+  passes(item, s, authoritative=True)  -> post-check, full check-account payload
+
+The search endpoint returns a reduced item: no telegram_spam_block, no
+telegram_password, no country, no session age. Anything missing is treated as
+"unknown" and never rejects — the server-side query already filtered it.
+"""
 from __future__ import annotations
 
 import re
 
 TARGET_FALLBACK = 24.0
 
+_FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 _COUNTRY_RE = re.compile(r"\(([A-Z]{2})\)")
 _PHONE_RE = re.compile(r"\+\d{6,16}")
 
-# priority order: most explicit key wins
 _AGE_NUM_KEYS = (
     "telegram_session_age",
     "session_age",
@@ -28,7 +37,6 @@ _PERIOD_HOURS = {
     "г": 8760.0, "год": 8760.0, "года": 8760.0, "лет": 8760.0,
 }
 
-# "session age: 30 days", "сессия 2 месяца", "30d session"
 _AGE_TEXT_RES = (
     re.compile(
         r"(?:session\s*age|возраст\s*сесси[ия]|сесси[яи])\s*[:\-–—]?\s*"
@@ -49,12 +57,36 @@ def _num(value) -> float | None:
         return None
 
 
+def _as_bool(value) -> bool | None:
+    """Tri-state: True / False / None (unknown)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in ("1", "true", "yes", "y", "on"):
+            return True
+        if t in ("0", "false", "no", "n", "off", ""):
+            return False
+    return None
+
+
+def _flag_to_iso(match) -> str:
+    return "".join(chr(ord(ch) - 0x1F1E6 + 65) for ch in match.group(0))
+
+
 def country_of(item: dict) -> str:
-    """ISO2 country: explicit field first, then the "(XX)" marker in the title."""
-    explicit = str(item.get("country") or "").strip().upper()
-    if len(explicit) == 2 and explicit.isalpha():
-        return explicit
-    m = _COUNTRY_RE.search(item.get("title", "") or "")
+    """ISO2 country: explicit fields, then flag emoji, then the "(XX)" marker."""
+    for key in ("country", "country_code", "telegram_country"):
+        explicit = str(item.get(key) or "").strip().upper()
+        if len(explicit) == 2 and explicit.isalpha():
+            return explicit
+    text = f"{item.get('title') or ''} {item.get('description') or ''}"
+    flag = _FLAG_RE.search(text)
+    if flag:
+        return _flag_to_iso(flag)
+    m = _COUNTRY_RE.search(text)
     return m.group(1) if m else ""
 
 
@@ -96,18 +128,13 @@ def _age_from_text(item: dict) -> float | None:
             mult = _PERIOD_HOURS.get(unit)
             if mult:
                 return amount * mult
-            # bare "session 30" -> assume days (dominant market usage)
             if unit in ("", "s"):
                 return amount * 24.0
     return None
 
 
 def session_hours(item: dict) -> float | None:
-    """Age of the session in hours, or None when it cannot be determined.
-
-    The market does not expose session age as a structured item field — it is
-    only a search filter. So: numeric fields first, then title/description text.
-    """
+    """Age of the session in hours, or None when it cannot be determined."""
     for key in _AGE_NUM_KEYS:
         raw = item.get(key)
         v = _num(raw)
@@ -116,11 +143,11 @@ def session_hours(item: dict) -> float | None:
         mult = _period_hours(item) or _unit_from_key(key)
         if mult:
             return v * mult
-        if v > 100_000:      # seconds
+        if v > 100_000:
             return v / 3600
-        if v > 1_000:        # hours
+        if v > 1_000:
             return v
-        return v * 24.0      # days
+        return v * 24.0
     return _age_from_text(item)
 
 
@@ -129,71 +156,103 @@ def search_query(s: dict) -> dict:
     floor = _num(s.get("session_min_hours")) or 0.0
     days = int(floor // 24)
     if days < 1:
-        return {}  # sub-day floors: the API only knows day/month/year
+        return {}
     if days % 30 == 0:
         return {"session_age": days // 30, "session_age_period": "month"}
     return {"session_age": days, "session_age_period": "day"}
 
 
-def spam_ok(item: dict, mode: str) -> bool:
-    if mode == "any":
-        return True
-    flag = item.get("telegram_spam_block")
-    return (flag is True) if mode == "yes" else (flag is not True)
+def spam_state(item: dict) -> bool | None:
+    return _as_bool(item.get("telegram_spam_block"))
 
 
-def has_mail(item: dict) -> bool:
-    return bool(item.get("telegram_email")) or item.get("email_type") not in (None, "", "no")
+def mail_state(item: dict) -> bool | None:
+    flag = _as_bool(item.get("telegram_email"))
+    if flag is not None:
+        return flag
+    et = item.get("email_type")
+    if et is None:
+        return None
+    return str(et).strip().lower() not in ("", "no")
+
+
+def pass_state(item: dict) -> bool | None:
+    pw = item.get("telegram_password")
+    if pw is None:
+        return None
+    return bool(str(pw).strip())
 
 
 def _codes(raw: str) -> set[str]:
     return {c.strip().upper() for c in (raw or "").split(",") if c.strip()}
 
 
-def passes(item: dict, s: dict) -> tuple[bool, str]:
-    """Returns (ok, reason). Reason is short so the loop can log a tally."""
+def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]:
+    """Returns (ok, reason). Unknown fields never reject."""
     price = _num(item.get("price")) or 0.0
     if price < (_num(s.get("price_min")) or 0.0):
         return False, "price_min"
     if price > (_num(s.get("price_max")) or float("inf")):
         return False, "price_max"
-    if not spam_ok(item, s.get("spam_mode", "no")):
+
+    nsb = _as_bool(item.get("nsb"))
+    if s.get("nsb_only") == "1" and nsb is False:
+        return False, "resold"
+
+    if not authoritative:
+        return True, "ok"
+
+    unknown = False
+
+    spam = spam_state(item)
+    mode = s.get("spam_mode", "no")
+    if spam is None:
+        unknown = True
+    elif mode == "yes" and spam is False:
         return False, "spam"
-    if s.get("mail_mode") == "yes" and not has_mail(item):
+    elif mode == "no" and spam is True:
+        return False, "spam"
+
+    mail = mail_state(item)
+    mode = s.get("mail_mode", "any")
+    if mail is None:
+        unknown = True
+    elif mode == "yes" and mail is False:
         return False, "no_mail"
-    if s.get("mail_mode") == "no" and has_mail(item):
+    elif mode == "no" and mail is True:
         return False, "has_mail"
-    if s.get("password_mode") == "yes" and not item.get("telegram_password"):
+
+    has_pw = pass_state(item)
+    mode = s.get("password_mode", "any")
+    if has_pw is None:
+        unknown = True
+    elif mode == "yes" and has_pw is False:
         return False, "no_2fa"
-    if s.get("password_mode") == "no" and item.get("telegram_password"):
+    elif mode == "no" and has_pw is True:
         return False, "has_2fa"
 
     cc = country_of(item)
-    allow = _codes(s.get("countries", ""))
-    deny = _codes(s.get("deny_countries", ""))
-    if allow and cc not in allow:
-        return False, "country_not_included"
-    if cc and cc in deny:
-        return False, "country_excluded"
-
-    if s.get("nsb_only") == "1" and item.get("nsb") is False:
-        return False, "resold"
+    if cc:
+        if cc in _codes(s.get("deny_countries", "")):
+            return False, "country_excluded"
+        allow = _codes(s.get("countries", ""))
+        if allow and cc not in allow:
+            return False, "country_not_included"
+    else:
+        unknown = True
 
     floor = _num(s.get("session_min_hours")) or 0.0
     if floor:
         age = session_hours(item)
         if age is None:
-            # unknown age is not a reject — buy_one re-checks after check-account
-            return True, "age_unknown"
-        if age < floor:
+            unknown = True
+        elif age < floor:
             return False, "session_too_fresh"
-    return True, "ok"
+
+    return True, ("ok_unknown" if unknown else "ok")
 
 
 def clean_delay_hours(item: dict, target: float = TARGET_FALLBACK) -> float:
-    """Hours to wait before cleaning. 0.0 means clean immediately.
-
-    Unknown age counts as 0, i.e. the full target is waited out — never early.
-    """
+    """Hours to wait before cleaning. 0.0 means clean immediately."""
     age = session_hours(item) or 0.0
     return max(0.0, float(target) - age)

@@ -5,8 +5,12 @@ import time
 import httpx
 
 from app.config import CACHE_TTL, HTTP_TIMEOUT, LZT_BASE, LZT_TOKEN, SEARCH_DELAY
+from app.utils.filters import search_query
 from app.utils.money import (parse_balances, parse_user, pick_for_buy,
                              same_currency, spendable)
+
+CACHE_MAX = 200
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class LztError(Exception):
@@ -16,7 +20,7 @@ class LztError(Exception):
 
     @property
     def retryable(self) -> bool:
-        return "retry" in str(self).lower()
+        return self.status in RETRYABLE_STATUS or "retry" in str(self).lower()
 
 
 class LztClient:
@@ -41,6 +45,12 @@ class LztClient:
         return None
 
     def _store(self, key: str, value):
+        if len(self._cache) >= CACHE_MAX:
+            now = time.time()
+            for k in [k for k, (ts, _) in self._cache.items() if now - ts >= CACHE_TTL]:
+                self._cache.pop(k, None)
+            if len(self._cache) >= CACHE_MAX:
+                self._cache.pop(next(iter(self._cache)), None)
         self._cache[key] = (time.time(), value)
         return value
 
@@ -48,17 +58,29 @@ class LztClient:
         self._cache.pop("balances", None)
         self._cache.pop("profile", None)
 
+    @staticmethod
+    def _retry_after(r: httpx.Response, attempt: int) -> float:
+        try:
+            return max(1.0, float(r.headers.get("Retry-After")))
+        except (TypeError, ValueError):
+            return 5.0 * (attempt + 1)
+
     async def _req(self, method: str, path: str, **kw):
+        last = "request failed"
         for attempt in range(4):
             try:
                 r = await self._http.request(method, path, **kw)
             except httpx.HTTPError as e:
+                last = f"network: {e}"
                 if attempt == 3:
-                    raise LztError(f"network: {e}")
+                    raise LztError(last)
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
             if r.status_code == 429:
-                await asyncio.sleep(5 * (attempt + 1))
+                last = "retry: 429 too many requests"
+                if attempt == 3:
+                    raise LztError(last, 429)
+                await asyncio.sleep(self._retry_after(r, attempt))
                 continue
             if r.status_code >= 400:
                 try:
@@ -70,6 +92,7 @@ class LztClient:
                 return r.json()
             except Exception:
                 return {}
+        raise LztError(last, 429)
 
     async def _search(self, params: dict):
         async with self._search_lock:
@@ -153,23 +176,23 @@ class LztClient:
     async def search(self, s: dict, cursor: str = None) -> list[dict]:
         p = {
             "pmin": s["price_min"], "pmax": s["price_max"],
-            "spam": s["spam_mode"], "email": s["mail_mode"],
+            # API enums are yes / no / nomatter — "any" must be translated
+            "spam": "nomatter" if s["spam_mode"] == "any" else s["spam_mode"],
+            "email": "nomatter" if s["mail_mode"] == "any" else s["mail_mode"],
             "order_by": "price_to_up", "currency": s["currency"],
         }
-        if s["password_mode"] != "any":
+        if s.get("password_mode") not in (None, "", "any"):
             p["password"] = s["password_mode"]
-        if s["mail_type"] != "any":
+        if s.get("mail_type") not in (None, "", "any"):
             p["email_type[]"] = [s["mail_type"]]
-        if s["nsb_only"] == "1":
+        if s.get("nsb_only") == "1":
             p["nsb"] = "true"
-        if s["countries"]:
+        if s.get("countries"):
             p["country[]"] = [c.strip().upper() for c in s["countries"].split(",") if c.strip()]
-        if s["deny_countries"]:
+        if s.get("deny_countries"):
             p["not_country[]"] = [c.strip().upper() for c in s["deny_countries"].split(",") if c.strip()]
-        hours = float(s["session_min_hours"] or 0)
-        if hours >= 48:
-            p["session_age"] = int(hours // 24)
-            p["session_age_period"] = "day"
+        # single source of truth for the age floor (day/month granularity only)
+        p.update(search_query(s))
         if cursor:
             p["after"] = cursor
         return (await self._search(p)).get("items") or []
@@ -178,7 +201,15 @@ class LztClient:
         return (await self._req("GET", f"/{item_id}")).get("item") or {}
 
     async def check_account(self, item_id: int) -> dict:
-        return await self._req("POST", f"/{item_id}/check-account")
+        for attempt in range(3):
+            try:
+                return await self._req("POST", f"/{item_id}/check-account")
+            except LztError as e:
+                if e.retryable and attempt < 2:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                raise
+        raise LztError("check-account retries exhausted")
 
     async def fast_buy(self, item_id: int, price: float, balance_id: int | None = None) -> dict:
         body = {"price": price}

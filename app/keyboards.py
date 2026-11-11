@@ -12,6 +12,7 @@ BACK_SESSIONS = "m:sessions"
 
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    """Build a markup, dropping empty rows and empty buttons."""
     b = InlineKeyboardBuilder()
     widths: list[int] = []
     for row in rows:
@@ -34,6 +35,8 @@ def _onoff(flag: str, on: str, off: str) -> str:
     return on if flag == "1" else off
 
 
+# ─── main ──────────────────────────────────────────────────────────────────
+
 def main(s: dict) -> InlineKeyboardMarkup:
     return kb([
         [("⏸ Stop" if s["auto_buy"] == "1" else "▶️ Start", "t:auto_buy")],
@@ -42,6 +45,8 @@ def main(s: dict) -> InlineKeyboardMarkup:
         [("Stats", "m:stats")],
     ])
 
+
+# ─── filters ───────────────────────────────────────────────────────────────
 
 def filters(s: dict) -> InlineKeyboardMarkup:
     return kb([
@@ -105,6 +110,8 @@ def floors() -> InlineKeyboardMarkup:
     return pick("s:session_min_hours", ["0", "12", "18", "23", "24"])
 
 
+# ─── sessions ─────────────────────────────────────────────────────────────
+
 def sessions(items: list[dict]) -> InlineKeyboardMarkup:
     rows = [[(f"📱 {p.get('phone') or p['item_id']}", f"v:{p['_id']}")] for p in items]
     rows.append([("Refresh", BACK_SESSIONS)])
@@ -121,6 +128,17 @@ def session_detail(p: dict) -> InlineKeyboardMarkup:
     ])
 
 
+def bought(p: dict) -> InlineKeyboardMarkup:
+    """Attached to every purchase notification."""
+    pid = p["_id"]
+    return kb([
+        [("Session file", f"f:{pid}"), ("Check", f"c:{pid}")],
+        [("Clean now", f"k:{pid}")],
+    ])
+
+
+# ─── wallet ───────────────────────────────────────────────────────────────
+
 def wallet(entries: list[dict]) -> InlineKeyboardMarkup:
     rows = [[("Refresh", BACK_WALLET), ("Payments", "m:payments")]]
     if len(entries) > 1:
@@ -131,6 +149,7 @@ def wallet(entries: list[dict]) -> InlineKeyboardMarkup:
 
 def exchange(pool: list[dict], step: str, offset: int = 0,
              page_size: int = 8) -> InlineKeyboardMarkup:
+    """Paged picker; the index is absolute so paging never shifts targets."""
     chunk = pool[offset:offset + page_size]
     rows: list[list[tuple[str, str]]] = []
     row: list[tuple[str, str]] = []
@@ -159,6 +178,8 @@ def amount(currency: str, available: float) -> InlineKeyboardMarkup:
     quick = [(str(v), f"xa:{v}") for v in (10, 50, 100) if v <= available] or [("10", "xa:10")]
     return kb([quick, [("Max", "xa:max"), ("Cancel", "xc")]])
 
+
+# ─── report ───────────────────────────────────────────────────────────────
 
 def report() -> InlineKeyboardMarkup:
     return kb([

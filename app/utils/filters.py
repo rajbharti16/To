@@ -1,12 +1,7 @@
 """Pure filter logic — no IO, unit-testable.
 
-Two phases:
-  passes(item, s)                      -> pre-check, search result fields only
-  passes(item, s, authoritative=True)  -> post-check, full check-account payload
-
-Age is derived from the account's real creation timestamp first (created_at /
-registration_date and friends), then from session-age fields, then from the
-title text. Anything missing stays "unknown" and never rejects.
+Age comes from the real account creation time first, then session-age fields,
+then the title. Anything unreadable stays "unknown" and never rejects.
 """
 from __future__ import annotations
 
@@ -27,12 +22,8 @@ _CREATED_KEYS = (
 )
 _CREATED_NESTED = ("item_origin", "origin", "telegram", "item", "meta", "account")
 
-_AGE_NUM_KEYS = (
-    "telegram_session_age",
-    "session_age",
-    "session_age_hours",
-    "session_age_seconds",
-)
+_AGE_NUM_KEYS = ("telegram_session_age", "session_age", "session_age_hours",
+                 "session_age_seconds")
 _PERIOD_KEYS = ("session_age_period", "telegram_session_age_period")
 
 _PERIOD_HOURS = {
@@ -47,14 +38,13 @@ _PERIOD_HOURS = {
 }
 
 _AGE_TEXT_RES = (
-    re.compile(
-        r"(?:session\s*age|возраст\s*сесси[ия]|сесси[яи])\s*[:\-–—]?\s*"
-        r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?"
-    ),
-    re.compile(
-        r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?\s*(?:session|сесси[ия])"
-    ),
+    re.compile(r"(?:session\s*age|возраст\s*сесси[ия]|сесси[яи])\s*[:\-–—]?\s*"
+               r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?"),
+    re.compile(r"(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]+)?\s*(?:session|сесси[ия])"),
 )
+
+_TRUE = {"1", "true", "yes", "y", "on", "да", "blocked", "ban", "spam"}
+_FALSE = {"0", "false", "no", "n", "off", "", "none", "nomatter", "-"}
 
 
 def _num(value) -> float | None:
@@ -66,23 +56,23 @@ def _num(value) -> float | None:
         return None
 
 
-_TRUE = {"1", "true", "yes", "y", "on", "да"}
-_FALSE = {"0", "false", "no", "n", "off", ""}
-
-
-def _as_bool(value) -> bool | None:
-    """Tri-state: True / False / None (unknown). Free text counts as True."""
+def _flag(value) -> bool | None:
+    """Explicit flag → bool; ambiguous text (a date, an address) → None."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return value != 0
+    if isinstance(value, dict):
+        for key in ("is_blocked", "blocked", "status", "value", "result"):
+            if key in value:
+                return _flag(value[key])
+        return None
     if isinstance(value, str):
         t = value.strip().lower()
         if t in _TRUE:
             return True
         if t in _FALSE:
             return False
-        return True          # e.g. an actual address
     return None
 
 
@@ -91,7 +81,6 @@ def _flag_to_iso(match) -> str:
 
 
 def country_of(item: dict) -> str:
-    """ISO2 country: explicit fields, then flag emoji, then the "(XX)" marker."""
     for key in ("country", "country_code", "telegram_country"):
         explicit = str(item.get(key) or "").strip().upper()
         if len(explicit) == 2 and explicit.isalpha():
@@ -110,7 +99,6 @@ def phone_of(item: dict) -> str:
 
 
 def account_created_ts(item: dict, depth: int = 0) -> int | None:
-    """Epoch seconds of the account creation, from any plausible field."""
     if depth > 3 or not isinstance(item, dict):
         return None
     for key in _CREATED_KEYS:
@@ -166,7 +154,6 @@ def _age_from_text(item: dict) -> float | None:
 
 
 def session_hours(item: dict) -> float | None:
-    """Session age in hours, from age fields or the title. None when unknown."""
     for key in _AGE_NUM_KEYS:
         raw = item.get(key)
         v = _num(raw)
@@ -175,16 +162,15 @@ def session_hours(item: dict) -> float | None:
         mult = _period_hours(item) or _unit_from_key(key)
         if mult:
             return v * mult
-        if v > 100_000:      # plainly seconds
+        if v > 100_000:
             return v / 3600
-        if v > 1_000:        # plainly hours
+        if v > 1_000:
             return v
-        return v * 24.0      # LZT default unit is days
+        return v * 24.0
     return _age_from_text(item)
 
 
 def age_hours_of(item: dict, at: int | None = None) -> float | None:
-    """Authoritative age: real creation time first, session age as fallback."""
     created = account_created_ts(item)
     if created:
         return age_hours(created, at)
@@ -192,7 +178,7 @@ def age_hours_of(item: dict, at: int | None = None) -> float | None:
 
 
 def search_query(s: dict) -> dict:
-    """Server-side age floor. Empty dict when no floor is configured."""
+    """Server-side age floor only (day granularity is all the API supports)."""
     floor = _num(s.get("session_min_hours")) or 0.0
     days = int(floor // 24)
     if days < 1:
@@ -203,13 +189,24 @@ def search_query(s: dict) -> dict:
 
 
 def spam_state(item: dict) -> bool | None:
-    return _as_bool(item.get("telegram_spam_block"))
+    for key in ("telegram_spam_block", "spam_block", "is_spam_blocked", "spam"):
+        if key in item:
+            state = _flag(item[key])
+            if state is not None:
+                return state
+    return None
 
 
 def mail_state(item: dict) -> bool | None:
-    flag = _as_bool(item.get("telegram_email"))
-    if flag is not None:
-        return flag
+    for key in ("telegram_email", "email", "has_email"):
+        if key not in item:
+            continue
+        raw = item[key]
+        if isinstance(raw, str) and "@" in raw:
+            return True
+        state = _flag(raw)
+        if state is not None:
+            return state
     if "email_type" in item:
         et = str(item.get("email_type") or "").strip().lower()
         return et not in ("", "no", "none")
@@ -218,8 +215,14 @@ def mail_state(item: dict) -> bool | None:
 
 def pass_state(item: dict) -> bool | None:
     for key in ("telegram_password", "password", "has_password"):
-        if key in item:
-            return bool(str(item.get(key) or "").strip())
+        if key not in item:
+            continue
+        raw = item[key]
+        if isinstance(raw, str) and raw.strip() and raw.strip().lower() not in _FALSE:
+            return True
+        state = _flag(raw)
+        if state is not None:
+            return state
     return None
 
 
@@ -235,7 +238,7 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
     if price > (_num(s.get("price_max")) or float("inf")):
         return False, "price_max"
 
-    if s.get("nsb_only") == "1" and _as_bool(item.get("nsb")) is False:
+    if s.get("nsb_only") == "1" and _flag(item.get("nsb")) is False:
         return False, "resold"
 
     floor = _num(s.get("session_min_hours")) or 0.0
@@ -244,9 +247,9 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
         age = age_hours_of(item)
         if age is not None:
             if floor and age < floor:
-                return False, "session_too_fresh"
+                return False, "too_fresh"
             if cap and age > cap:
-                return False, "session_too_old"
+                return False, "too_old"
 
     if not authoritative:
         return True, "ok"
@@ -258,7 +261,7 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
     if spam is None:
         unknown = True
     elif mode == "yes" and spam is False:
-        return False, "spam"
+        return False, "spam_missing"
     elif mode == "no" and spam is True:
         return False, "spam"
 
@@ -298,7 +301,6 @@ def passes(item: dict, s: dict, authoritative: bool = False) -> tuple[bool, str]
 
 def clean_delay_hours(item: dict, target: float = TARGET_FALLBACK,
                       early: bool = True) -> float:
-    """Hours to wait before cleaning, capped at `target`."""
     target = max(0.0, float(target))
     if not early:
         return target

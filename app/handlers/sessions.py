@@ -14,9 +14,8 @@ router = Router()
 
 
 async def _list(target, cq: CallbackQuery | None = None):
-    tg_id = target.from_user.id
-    rows = await db.active_purchases(tg_id)
-    text = (f"<b>Sessions</b> · {len(rows)}" if rows else "no sessions queued")
+    rows = await db.active_purchases(target.from_user.id)
+    text = f"<b>Sessions</b> · {len(rows)}" if rows else "no sessions queued"
     markup = kb.sessions(rows) if rows else kb.back()
     if cq:
         return await show(cq, text, markup)
@@ -90,8 +89,8 @@ async def cb_kill(cq: CallbackQuery):
 
     await db.close_purchase(pid, "killed", "manual clean")
     if p.get("session_string"):
+        c = client(p["session_string"])
         try:
-            c = client(p["session_string"])
             await c.connect()
             await terminate(c)
         except Exception:
